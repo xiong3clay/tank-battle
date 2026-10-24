@@ -22,6 +22,8 @@ const PLAYER_LIVES = 3;
 const INVINCIBLE_TIME = 2;   // 重生无敌秒数
 const MAX_LEVEL = 5;         // 通关总关卡数
 
+const HIGH_SCORE_KEY = 'tank-battle-highscore';
+
 const TILE_EMPTY = 0;
 const TILE_BRICK = 1;
 const TILE_STEEL = 2;
@@ -67,6 +69,106 @@ function mulberry32(seed) {
 function rectsOverlap(a, b) {
   return a.x < b.x + b.w && a.x + a.w > b.x &&
          a.y < b.y + b.h && a.y + a.h > b.y;
+}
+
+// ==================== 音效合成（WebAudio，无任何外部音频文件） ====================
+class Sfx {
+  constructor() {
+    this.ctx = null;
+    this.master = null;
+    this.noise = null;
+    this.muted = false;
+  }
+
+  // 创建 / 恢复音频上下文：只在首次用户交互之后调用
+  unlock() {
+    if (!this.ctx) {
+      const AC = window.AudioContext || window.webkitAudioContext;
+      if (!AC) return null;
+      try {
+        this.ctx = new AC();
+        this.master = this.ctx.createGain();
+        this.master.gain.value = 0.35;
+        this.master.connect(this.ctx.destination);
+        this.noise = this.makeNoise();
+      } catch (_) {
+        this.ctx = null;
+        return null;
+      }
+    }
+    if (this.ctx.state === 'suspended') this.ctx.resume().catch(() => {});
+    return this.ctx;
+  }
+
+  makeNoise() {
+    const len = Math.floor(this.ctx.sampleRate * 0.5);
+    const buf = this.ctx.createBuffer(1, len, this.ctx.sampleRate);
+    const data = buf.getChannelData(0);
+    for (let i = 0; i < len; i++) data[i] = Math.random() * 2 - 1;
+    return buf;
+  }
+
+  toggleMute() {
+    this.muted = !this.muted;
+    return this.muted;
+  }
+
+  play(kind) {
+    if (this.muted) return;
+    if (!this.unlock()) return;
+    const t = this.ctx.currentTime;
+    if (kind === 'fire') this.fire(t);
+    else if (kind === 'explosion') this.explosion(t);
+    else if (kind === 'hit') this.hit(t);
+    else if (kind === 'clear') this.clear(t);
+  }
+
+  // 单个振荡器音：type 波形，freq 起始频率，freqEnd 终止频率（可省）
+  tone(type, freq, t, dur, gain, freqEnd) {
+    const osc = this.ctx.createOscillator();
+    const g = this.ctx.createGain();
+    osc.type = type;
+    osc.frequency.setValueAtTime(freq, t);
+    if (freqEnd !== undefined) osc.frequency.exponentialRampToValueAtTime(Math.max(1, freqEnd), t + dur);
+    g.gain.setValueAtTime(gain, t);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    osc.connect(g).connect(this.master);
+    osc.start(t);
+    osc.stop(t + dur + 0.02);
+  }
+
+  // 噪声爆炸音：低通滤波由亮到暗
+  burst(t, dur, gain, cutoff) {
+    const src = this.ctx.createBufferSource();
+    src.buffer = this.noise;
+    const lp = this.ctx.createBiquadFilter();
+    lp.type = 'lowpass';
+    lp.frequency.setValueAtTime(cutoff, t);
+    lp.frequency.exponentialRampToValueAtTime(180, t + dur);
+    const g = this.ctx.createGain();
+    g.gain.setValueAtTime(gain, t);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    src.connect(lp).connect(g).connect(this.master);
+    src.start(t);
+    src.stop(t + dur + 0.02);
+  }
+
+  fire(t) { this.tone('square', 620, t, 0.09, 0.12, 180); }
+
+  explosion(t) {
+    this.burst(t, 0.35, 0.5, 1400);
+    this.tone('sine', 110, t, 0.25, 0.28, 40);
+  }
+
+  hit(t) {
+    this.burst(t, 0.28, 0.35, 900);
+    this.tone('sawtooth', 240, t, 0.4, 0.22, 55);
+  }
+
+  clear(t) {
+    const notes = [523.25, 659.25, 783.99, 1046.5];
+    notes.forEach((f, i) => this.tone('triangle', f, t + i * 0.11, 0.16, 0.2));
+  }
 }
 
 // ==================== 实体基类 ====================
@@ -115,6 +217,10 @@ class Game {
     this.level = 1;
     this.score = 0;
     this.lives = PLAYER_LIVES;
+    this.highScore = this.loadHighScore();
+
+    // 音效（首次用户交互后才创建 AudioContext）
+    this.sfx = new Sfx();
 
     this.map = null;
     this.player = null;
@@ -139,6 +245,7 @@ class Game {
     this.lastTime = 0;
     this.setupCanvasDPR();
     this.bindInput();
+    this.bindAudioUnlock();
     this.bindTouch();
     this.bindResize();
     requestAnimationFrame((t) => this.loop(t));
@@ -156,6 +263,36 @@ class Game {
   bindResize() {
     window.addEventListener('resize', () => this.setupCanvasDPR());
     window.addEventListener('orientationchange', () => this.setupCanvasDPR());
+  }
+
+  // ---------------- 音效与最高分 ----------------
+  // 首次用户交互后才创建 AudioContext（浏览器自动播放策略要求）
+  bindAudioUnlock() {
+    const unlock = () => this.sfx.unlock();
+    window.addEventListener('keydown', unlock, { once: true });
+    window.addEventListener('pointerdown', unlock, { once: true });
+  }
+
+  toggleMute() {
+    return this.sfx.toggleMute();
+  }
+
+  loadHighScore() {
+    try {
+      const v = parseInt(window.localStorage.getItem(HIGH_SCORE_KEY), 10);
+      return Number.isFinite(v) && v > 0 ? v : 0;
+    } catch (_) {
+      return 0; // file:// 下部分浏览器禁用 localStorage
+    }
+  }
+
+  // 仅在刷新纪录时写盘
+  commitHighScore() {
+    if (this.score <= this.highScore) return;
+    this.highScore = this.score;
+    try {
+      window.localStorage.setItem(HIGH_SCORE_KEY, String(this.highScore));
+    } catch (_) {}
   }
 
   // ---------------- 地图生成 ----------------
@@ -315,6 +452,7 @@ class Game {
     const by = cy - BULLET_SIZE / 2 + v.y * (tank.h / 2);
     this.bullets.push(new Bullet(bx, by, tank.dir, tank));
     tank.fireCooldown = tank.isPlayer ? 0.25 : 0.5;
+    this.sfx.play('fire');
   }
 
   // ---------------- 更新逻辑 ----------------
@@ -451,6 +589,7 @@ class Game {
             this.enemiesAlive--;
             this.score += 100;
             this.addExplosion(e.x + e.w / 2, e.y + e.h / 2);
+            this.sfx.play('explosion');
             break;
           }
         }
@@ -470,9 +609,11 @@ class Game {
   playerHit() {
     this.lives--;
     this.addExplosion(this.player.x + this.player.w / 2, this.player.y + this.player.h / 2);
+    this.sfx.play('hit');
     if (this.lives <= 0) {
       this.player.alive = false;
       this.state = 'gameover';
+      this.commitHighScore();
     } else {
       // 原地重生 + 无敌
       const px = 4 * TILE + (TILE - TANK_SIZE) / 2;
@@ -493,9 +634,11 @@ class Game {
     this.addExplosion(9 * TILE, 13 * TILE);
     this.addExplosion(10 * TILE, 13 * TILE);
     this.addExplosion(11 * TILE, 13 * TILE);
+    this.sfx.play('explosion');
     // 0.6 秒红黑闪烁后进入 gameover
     this.baseFlashTimer = 0.6;
     this.state = 'gameover';
+    this.commitHighScore();
   }
 
   addExplosion(x, y) {
@@ -520,8 +663,10 @@ class Game {
   checkLevelClear() {
     if (this.enemiesToSpawn === 0 && this.enemiesAlive === 0 && this.enemies.length === 0) {
       this.score += 500;
+      this.sfx.play('clear');
       if (this.level >= MAX_LEVEL) {
         this.state = 'win';
+        this.commitHighScore();
       } else {
         this.startLevel(this.level + 1);
       }
@@ -755,7 +900,9 @@ class Game {
     ctx.fillText(`关卡 ${this.level}/${MAX_LEVEL}`, 12, 14);
     ctx.fillText(`敌人 ${this.enemiesToSpawn + this.enemiesAlive}`, 130, 14);
     ctx.fillText(`生命 ${'♥'.repeat(Math.max(0, this.lives))}`, 250, 14);
-    ctx.fillText(`分数 ${this.score}`, 400, 14);
+    ctx.fillText(`分数 ${this.score}`, 372, 14);
+    ctx.fillText(`最高分 ${this.highScore}`, 500, 14);
+    ctx.fillText(`音效 ${this.sfx.muted ? '关' : '开'}`, 690, 14);
   }
 
   renderStart() {
@@ -783,7 +930,7 @@ class Game {
       '操作说明',
       '移动：W A S D 或 方向键',
       '开火：空格 或 J',
-      '暂停：P        重开：R',
+      `暂停：P    重开：R    静音：M（当前音效：${this.sfx.muted ? '关' : '开'}）`,
       '',
       '目标：消灭全部敌方坦克，保护基地不被击中',
       '击毁敌人 +100，通关额外 +500',
@@ -825,13 +972,15 @@ class Game {
     ctx.font = 'bold 56px Consolas, monospace';
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
-    ctx.fillText('游 戏 结 束', WIDTH / 2, HEIGHT / 2 - 60);
+    ctx.fillText('游 戏 结 束', WIDTH / 2, HEIGHT / 2 - 72);
     ctx.fillStyle = '#fff';
     ctx.font = '24px Consolas, monospace';
-    ctx.fillText(`最终分数：${this.score}`, WIDTH / 2, HEIGHT / 2);
+    ctx.fillText(`最终分数：${this.score}`, WIDTH / 2, HEIGHT / 2 - 10);
     ctx.fillStyle = COLORS.bullet;
     ctx.font = '20px Consolas, monospace';
-    ctx.fillText(this.isTouch ? '点击右上重开按钮' : '按 R 重新开始', WIDTH / 2, HEIGHT / 2 + 50);
+    ctx.fillText(`历史最高分：${this.highScore}`, WIDTH / 2, HEIGHT / 2 + 30);
+    ctx.fillStyle = '#fff';
+    ctx.fillText(this.isTouch ? '点击右上重开按钮' : '按 R 重新开始', WIDTH / 2, HEIGHT / 2 + 75);
     ctx.textAlign = 'left';
   }
 
@@ -843,13 +992,15 @@ class Game {
     ctx.font = 'bold 56px Consolas, monospace';
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
-    ctx.fillText('通 关 胜 利', WIDTH / 2, HEIGHT / 2 - 60);
+    ctx.fillText('通 关 胜 利', WIDTH / 2, HEIGHT / 2 - 72);
     ctx.fillStyle = '#fff';
     ctx.font = '24px Consolas, monospace';
-    ctx.fillText(`最终分数：${this.score}`, WIDTH / 2, HEIGHT / 2);
+    ctx.fillText(`最终分数：${this.score}`, WIDTH / 2, HEIGHT / 2 - 10);
     ctx.fillStyle = COLORS.bullet;
     ctx.font = '20px Consolas, monospace';
-    ctx.fillText(this.isTouch ? '点击右上重开按钮' : '按 R 重新开始', WIDTH / 2, HEIGHT / 2 + 50);
+    ctx.fillText(`历史最高分：${this.highScore}`, WIDTH / 2, HEIGHT / 2 + 30);
+    ctx.fillStyle = '#fff';
+    ctx.fillText(this.isTouch ? '点击右上重开按钮' : '按 R 重新开始', WIDTH / 2, HEIGHT / 2 + 75);
     ctx.textAlign = 'left';
   }
 
@@ -867,7 +1018,14 @@ class Game {
     }
 
     if (down) {
+      const wasDown = this.keys[code];
       this.keys[code] = true;
+
+      // M 键切换静音（按住不重复触发；开始界面也可切换且不会开局）
+      if (code === 'KeyM') {
+        if (!wasDown) this.toggleMute();
+        if (this.state === 'start') return;
+      }
 
       if (this.state === 'start') {
         this.startGame();
