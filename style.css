@@ -177,22 +177,50 @@ html, body {
   inset: 0;
   z-index: 30;
   display: flex;
-  align-items: center;
-  justify-content: center;
+  align-items: flex-start;
+  justify-content: flex-end;
+  padding: 14px 16px 0 0;
   pointer-events: none; /* 背景不拦截，触屏单人开局不受影响 */
 }
 
 #lobby-panel {
   pointer-events: auto;
   width: min(320px, 86vw);
-  padding: 22px 26px 18px;
-  background: rgba(10, 10, 22, 0.88);
+  padding: 18px 22px 14px;
+  background: rgba(10, 10, 22, 0.97);
   border: 2px solid rgba(74, 222, 128, 0.55);
   border-radius: 12px;
   box-shadow: 0 0 24px rgba(0, 0, 0, 0.6);
   text-align: center;
   color: #e5e7eb;
 }
+
+.lobby-collapsed { display: none !important; }
+
+#lobby-toggle {
+  pointer-events: auto;
+  align-self: flex-start;
+  padding: 8px 16px;
+  font: inherit;
+  font-size: 14px;
+  font-weight: bold;
+  color: #4ade80;
+  background: rgba(10, 10, 22, 0.9);
+  border: 2px solid rgba(74, 222, 128, 0.55);
+  border-radius: 10px;
+  cursor: pointer;
+  touch-action: manipulation;
+}
+#lobby-toggle:active { background: rgba(74, 222, 128, 0.25); }
+
+#lobby-close {
+  float: right;
+  cursor: pointer;
+  color: #9ca3af;
+  font-size: 16px;
+  letter-spacing: 0;
+}
+#lobby-close:hover { color: #fff; }
 
 #lobby-title {
   font-size: 18px;
@@ -247,5 +275,11 @@ html, body {
   font-size: 13px;
   line-height: 1.5;
   color: #fbbf24;
+}
+
+#lobby-hint {
+  margin-top: 10px;
+  font-size: 12px;
+  color: #6b7280;
   word-break: break-all;
 }

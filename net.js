@@ -17,6 +17,11 @@
   var conn = null;
   var timer = null;
   var suppress = false; // 主动清理期间静默对端回调
+  var hbTimer = null;
+  var lastSeen = 0;
+
+  var HB_INTERVAL = 2500;  // 心跳间隔
+  var HB_TIMEOUT = 8000;   // 超过这个时间没收到任何数据 → 判定对端掉线
 
   var handlers = { open: [], peer: [], leave: [], data: [], error: [] };
 
@@ -61,11 +66,28 @@
   // 静默清理连接与 Peer，状态回 idle（不触发任何事件）
   function cleanup() {
     clearTimer();
+    stopHeartbeat();
     suppress = true;
     if (conn) { try { conn.close(); } catch (_) {} conn = null; }
     if (peer) { try { peer.destroy(); } catch (_) {} peer = null; }
     suppress = false;
     setState('idle');
+  }
+
+  // 心跳：对端被强杀/网络断开时，DataChannel 的 close 事件可能不触发，
+  // 靠"多久没收到任何数据"判定掉线，避免另一方一直以为还在连着
+  function stopHeartbeat() {
+    if (hbTimer) { clearInterval(hbTimer); hbTimer = null; }
+  }
+
+  function startHeartbeat() {
+    stopHeartbeat();
+    lastSeen = Date.now();
+    hbTimer = setInterval(function () {
+      if (state !== 'connected' || !conn || !conn.open) return;
+      if (Date.now() - lastSeen > HB_TIMEOUT) { onLeave(); return; }
+      try { conn.send({ t: 'hb' }); } catch (_) {}
+    }, HB_INTERVAL);
   }
 
   // 失败：清理后进入 error 状态并通知
@@ -94,10 +116,12 @@
       if (suppress) return;
       clearTimer();
       setState('connected');
+      startHeartbeat();
       emit('open', { id: c.peer });
     });
     c.on('data', function (d) {
       if (suppress) return;
+      lastSeen = Date.now();
       emit('data', d);
     });
     c.on('close', function () {
