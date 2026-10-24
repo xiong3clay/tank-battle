@@ -13,6 +13,20 @@
   <canvas id="game" width="800" height="600"></canvas>
 </div>
 
+<!-- 双人对战大厅（仅开始界面显示；背景不拦截点击，单人模式不受影响） -->
+<div id="lobby" class="lobby-hidden">
+  <div id="lobby-panel">
+    <div id="lobby-title">双人对战</div>
+    <input id="room-input" type="text" inputmode="numeric" maxlength="6" pattern="\d{6}"
+           placeholder="6 位房间号" autocomplete="off">
+    <div id="lobby-btns">
+      <button id="btn-host" type="button">开房间</button>
+      <button id="btn-join" type="button">加入房间</button>
+    </div>
+    <div id="net-status"></div>
+  </div>
+</div>
+
 <!-- 触屏控件层（仅触屏设备显示） -->
 <div id="touch-overlay" class="touch-hidden">
   <div id="joystick-zone">
@@ -29,6 +43,95 @@
   </div>
 </div>
 
+<script src="vendor/peerjs.min.js"></script>
+<script src="net.js"></script>
 <script src="game.js"></script>
+<script>
+/* 大厅交互：联机模块缺失时降级为提示，绝不影响单人模式 */
+(function () {
+  'use strict';
+  function $(id) { return document.getElementById(id); }
+  var lobby = $('lobby'), input = $('room-input'),
+      btnHost = $('btn-host'), btnJoin = $('btn-join'), statusEl = $('net-status');
+  if (!lobby || !input || !btnHost || !btnJoin || !statusEl) return;
+
+  function setStatus(msg) { statusEl.textContent = msg || ''; }
+  function setBusy(busy) {
+    btnHost.disabled = busy; btnJoin.disabled = busy; input.disabled = busy;
+  }
+
+  // 输入框按键不冒泡，避免打字触发游戏“任意键开始”
+  input.addEventListener('keydown', function (e) { e.stopPropagation(); });
+  input.addEventListener('keyup', function (e) { e.stopPropagation(); });
+  input.addEventListener('input', function () {
+    input.value = input.value.replace(/\D/g, '').slice(0, 6);
+  });
+
+  var duelStarted = false;
+
+  // 连接成功后进入对战；startDuel 可能尚未实现，判空并等它出现
+  function tryStartDuel() {
+    if (duelStarted) return;
+    var g = window.__game;
+    if (g && typeof g.startDuel === 'function') {
+      duelStarted = true;
+      try { g.startDuel(!!(window.Net && window.Net.isHost)); } catch (e) { console.error(e); }
+    }
+  }
+
+  function readCode() {
+    var code = input.value.trim();
+    if (!/^\d{6}$/.test(code)) { setStatus('请输入 6 位数字房间号'); return null; }
+    return code;
+  }
+
+  var Net = window.Net;
+  if (!Net) {
+    setBusy(true);
+    setStatus('联机模块未加载，仅可单人游戏');
+  } else {
+    btnHost.addEventListener('click', function () {
+      var code = readCode(); if (!code) return;
+      duelStarted = false;
+      setBusy(true);
+      setStatus('正在创建房间…');
+      Net.host(code);
+    });
+    btnJoin.addEventListener('click', function () {
+      var code = readCode(); if (!code) return;
+      duelStarted = false;
+      setBusy(true);
+      setStatus('正在加入房间…');
+      Net.join(code);
+    });
+    Net.on('peer', function () {
+      setStatus(Net.isHost ? '房间已创建，等待对方加入…' : '已连接服务器，正在加入…');
+    });
+    Net.on('open', function () {
+      setStatus('连接成功！正在进入对战…');
+      tryStartDuel();
+    });
+    Net.on('error', function (err) {
+      setBusy(false);
+      setStatus((err && err.message) || '连接失败，请重试');
+    });
+    Net.on('leave', function () {
+      setBusy(false);
+      duelStarted = false;
+      setStatus('连接已断开，可重新开房或加入');
+    });
+  }
+
+  // 大厅仅在开始界面显示；__game 尚不可用则隐藏，单人模式完全不受影响
+  setInterval(function () {
+    try {
+      var g = window.__game;
+      var inStart = !!(g && g.state === 'start');
+      lobby.classList.toggle('lobby-hidden', !inStart);
+      if (inStart && !duelStarted && Net && Net.status() === 'connected') tryStartDuel();
+    } catch (e) {}
+  }, 200);
+})();
+</script>
 </body>
 </html>

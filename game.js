@@ -36,6 +36,21 @@ const MAX_LIVES = 5;
 const POWERUP_COLORS = { shield: '#60a5fa', speed: '#fbbf24', supply: '#34d399' };
 const POWERUP_LABELS = { shield: '护盾', speed: '加速', supply: '补给' };
 
+// ==================== 双人对战常量 ====================
+const DUEL_LIVES = 3;                 // 每方初始生命
+const DUEL_INVINCIBLE = 1.5;          // 换场景复位后的无敌秒数
+const DUEL_NOTICE_TIME = 1.0;         // 「换场景」提示显示时长
+const SNAPSHOT_INTERVAL = 1 / 20;     // 主机状态快照 20Hz
+const INPUT_INTERVAL = 1 / 30;        // 客机按键上行 30Hz
+
+// 出生点：0 号左下、1 号右上，各自朝向来敌方向
+const DUEL_SPAWN_TILES = [{ r: 12, c: 2 }, { r: 2, c: 17 }];
+const DUEL_SPAWNS = DUEL_SPAWN_TILES.map(({ r, c }) => ({
+  x: c * TILE + (TILE - TANK_SIZE) / 2,
+  y: r * TILE + (TILE - TANK_SIZE) / 2
+}));
+const DUEL_SPAWN_DIRS = ['up', 'down'];
+
 const TILE_EMPTY = 0;
 const TILE_BRICK = 1;
 const TILE_STEEL = 2;
@@ -81,6 +96,13 @@ function mulberry32(seed) {
 function rectsOverlap(a, b) {
   return a.x < b.x + b.w && a.x + a.w > b.x &&
          a.y < b.y + b.h && a.y + a.h > b.y;
+}
+
+// 网络按键状态归一化：任何输入都收敛成 0/1，避免非法报文污染物理
+function normInput(k) {
+  if (!k || typeof k !== 'object') return { u: 0, d: 0, l: 0, r: 0, f: 0 };
+  const n = (v) => (v ? 1 : 0);
+  return { u: n(k.u), d: n(k.d), l: n(k.l), r: n(k.r), f: n(k.f) };
 }
 
 // ==================== 音效合成（WebAudio，无任何外部音频文件） ====================
@@ -235,12 +257,29 @@ class Game {
     this.ctx = canvas.getContext('2d');
     this.ctx.imageSmoothingEnabled = false;
 
-    this.state = 'start'; // start | playing | paused | gameover | win
+    this.state = 'start'; // start | playing | paused | gameover | win | over
+    this.mode = 'solo';   // solo | duel-host | duel-guest
     this.keys = {};
     this.level = 1;
     this.score = 0;
     this.lives = PLAYER_LIVES;
     this.highScore = this.loadHighScore();
+
+    // ---- 双人对战状态（solo 下全部闲置） ----
+    this.tanks = null;            // [0]=host方, [1]=guest方
+    this.localSide = 0;           // 本机操控的坦克编号
+    this.duelLives = [DUEL_LIVES, DUEL_LIVES];
+    this.duelScene = 1;
+    this.duelMapRev = 0;
+    this.duelWinner = null;
+    this.duelNotice = '';
+    this.duelNoticeT = 0;
+    this.remoteInput = { u: 0, d: 0, l: 0, r: 0, f: 0 };
+    this.inputSeq = 0;
+    this.netAcc = 0;              // 快照发送累加器
+    this.inputAcc = 0;            // 按键上行累加器
+    this._netBound = false;
+    this._boundNet = null;
 
     // 音效（首次用户交互后才创建 AudioContext）
     this.sfx = new Sfx();
@@ -344,12 +383,8 @@ class Game {
       }
       map.push(row);
     }
-    // 清空玩家出生点与敌人出生点附近
-    const clearSpots = [
-      [12, 4], [12, 6], [12, 8],        // 玩家底部区域
-      [1, 1], [1, 6], [1, 10], [1, 15], [1, 18] // 顶部敌人出生点
-    ];
-    for (const [r, c] of clearSpots) {
+    // 清空指定格子周围 3x3，保证出生点/重生点不会卡在墙里
+    const clearAround = (r, c) => {
       for (let dr = -1; dr <= 1; dr++) {
         for (let dc = -1; dc <= 1; dc++) {
           const rr = r + dr, cc = c + dc;
@@ -358,7 +393,22 @@ class Game {
           }
         }
       }
+    };
+
+    if (this.mode !== 'solo') {
+      // 双人对战场地：无基地、无敌人出生点，只清两辆坦克的出生区
+      // 双方用同一个 seed（场景编号）生成，客机据此还原同一张地图
+      for (const { r, c } of DUEL_SPAWN_TILES) clearAround(r, c);
+      return map;
     }
+
+    // 清空玩家出生点与敌人出生点附近
+    const clearSpots = [
+      [12, 4], [12, 6], [12, 8],        // 玩家底部区域
+      [1, 1], [1, 6], [1, 10], [1, 15], [1, 18] // 顶部敌人出生点
+    ];
+    for (const [r, c] of clearSpots) clearAround(r, c);
+
     // 基地：底部中央，占两格
     map[13][9] = TILE_BASE;
     map[13][10] = TILE_BASE;
@@ -397,6 +447,8 @@ class Game {
   }
 
   startGame() {
+    this.mode = 'solo';
+    this.tanks = null;
     this.score = 0;
     this.lives = PLAYER_LIVES;
     this.startLevel(1);
@@ -444,6 +496,13 @@ class Game {
   }
 
   collidesWithTank(rect, exclude) {
+    // 双人模式：只有两辆坦克互相阻挡
+    if (this.mode !== 'solo') {
+      for (const t of this.tanks || []) {
+        if (t && t !== exclude && t.alive && rectsOverlap(rect, t.rect)) return true;
+      }
+      return false;
+    }
     if (this.player && this.player !== exclude && this.player.alive &&
         rectsOverlap(rect, this.player.rect)) return true;
     for (const e of this.enemies) {
@@ -499,6 +558,11 @@ class Game {
   update(dt) {
     // 基地摧毁闪烁计时（gameover 状态下仍需递减）
     if (this.baseFlashTimer > 0) this.baseFlashTimer -= dt;
+
+    // 双人模式走各自的更新路径：host 跑物理，guest 只上行按键
+    if (this.mode === 'duel-host') { this.updateDuelHost(dt); return; }
+    if (this.mode === 'duel-guest') { this.updateDuelGuest(dt); return; }
+
     if (this.state !== 'playing') return;
 
     this.updatePlayer(dt);
@@ -844,6 +908,11 @@ class Game {
       return;
     }
 
+    if (this.mode !== 'solo') {
+      this.renderDuel();
+      return;
+    }
+
     this.renderMap();
     this.renderExplosions();
     this.renderPowerUps();
@@ -1003,8 +1072,10 @@ class Game {
       ctx.globalAlpha = 0.45 + 0.55 * (0.5 + 0.5 * Math.sin(tank.invincible * 14));
     }
 
-    const main = tank.isPlayer ? COLORS.player : COLORS.enemy;
-    const dark = tank.isPlayer ? COLORS.playerDark : COLORS.enemyDark;
+    // 双人模式：本机坦克用绿色，对手用红色，双方视角一致
+    const asPlayer = this.mode === 'solo' ? tank.isPlayer : tank.side === this.localSide;
+    const main = asPlayer ? COLORS.player : COLORS.enemy;
+    const dark = asPlayer ? COLORS.playerDark : COLORS.enemyDark;
 
     const { x, y, w, h, dir } = tank;
     // 车身
@@ -1235,15 +1306,8 @@ class Game {
         this.startGame();
         return;
       }
-      if (code === 'KeyP') {
-        if (this.state === 'playing') this.state = 'paused';
-        else if (this.state === 'paused') this.state = 'playing';
-      }
-      if (code === 'KeyR') {
-        if (this.state === 'gameover' || this.state === 'win') {
-          this.startGame();
-        }
-      }
+      if (code === 'KeyP') this.togglePause();
+      if (code === 'KeyR') this.handleRestart();
     } else {
       this.keys[code] = false;
     }
@@ -1331,17 +1395,14 @@ class Game {
 
     // ---- 暂停按钮 ----
     pauseBtn.addEventListener('click', () => {
-      if (ctx.state === 'playing') ctx.state = 'paused';
-      else if (ctx.state === 'paused') ctx.state = 'playing';
+      ctx.togglePause();
       ctx.syncTouchButtons();
     });
 
     // ---- 重开按钮 ----
     restartBtn.addEventListener('click', () => {
-      if (ctx.state === 'paused' || ctx.state === 'gameover' || ctx.state === 'win') {
-        ctx.startGame();
-        ctx.syncTouchButtons();
-      }
+      ctx.handleRestart();
+      ctx.syncTouchButtons();
     });
 
     // 开始界面：点击画布任意处也可开始
@@ -1381,6 +1442,470 @@ class Game {
     if (!this.restartBtn) return;
     if (this.state === 'playing' || this.state === 'start') this.restartBtn.classList.add('touch-hidden');
     else this.restartBtn.classList.remove('touch-hidden');
+  }
+
+  // ==================== 双人对战玩法 ====================
+  // 对外入口：大厅连接成功后调用 window.__game.startDuel(isHost)
+  startDuel(isHost) {
+    this.mode = isHost ? 'duel-host' : 'duel-guest';
+    this.localSide = isHost ? 0 : 1;
+    this.player = null;
+    this.enemies = [];
+    this.powerups = [];
+    this.activeEffects = { shield: 0, speed: 0 };
+    this.baseFlashTimer = 0;
+    this.baseWarn = false;
+    this.ensureDuelTanks();
+    this.resetDuelMatch();
+    this.bindNet();
+    if (this.mode === 'duel-guest') {
+      this.netSend({ t: 'hi', role: 'guest' });
+    } else {
+      this.sendSnapshot();
+    }
+  }
+
+  ensureDuelTanks() {
+    if (!this.tanks) this.tanks = [null, null];
+    for (let i = 0; i < 2; i++) {
+      if (this.tanks[i]) continue;
+      const t = new Tank(DUEL_SPAWNS[i].x, DUEL_SPAWNS[i].y, true);
+      t.side = i;
+      this.tanks[i] = t;
+    }
+  }
+
+  resetDuelMatch() {
+    this.duelLives = [DUEL_LIVES, DUEL_LIVES];
+    this.duelWinner = null;
+    this.duelScene = 1;
+    this.duelMapRev = 0;
+    this.duelNotice = '';
+    this.duelNoticeT = 0;
+    this.bullets = [];
+    this.explosions = [];
+    this.netAcc = 0;
+    this.inputAcc = 0;
+    this.map = this.generateMap(this.duelScene);
+    this.resetDuelTanks();
+    this.state = 'playing';
+  }
+
+  resetDuelTanks() {
+    for (let i = 0; i < 2; i++) {
+      const t = this.tanks && this.tanks[i];
+      if (!t) continue;
+      t.x = DUEL_SPAWNS[i].x;
+      t.y = DUEL_SPAWNS[i].y;
+      t.dir = DUEL_SPAWN_DIRS[i];
+      t.alive = true;
+      t.invincible = DUEL_INVINCIBLE;
+      t.fireCooldown = 0;
+    }
+  }
+
+  // ---------------- 网络桥接（window.Net 不存在时全部静默跳过） ----------------
+  bindNet() {
+    const Net = window.Net;
+    // 大厅重连时可能换成新的 Net 对象，此时需要重新挂监听
+    if (this._netBound && this._boundNet === Net) return;
+    if (!Net || typeof Net.on !== 'function') return;
+    this._netBound = true;
+    this._boundNet = Net;
+    const safe = (fn) => (...args) => { try { fn(...args); } catch (_) {} };
+    try {
+      Net.on('data', safe((msg) => this.handleDuelMessage(msg)));
+      Net.on('leave', safe(() => this.onDuelPeerLeave()));
+    } catch (_) {}
+  }
+
+  netSend(obj) {
+    const Net = window.Net;
+    if (!Net || typeof Net.send !== 'function') return false;
+    try { return Net.send(obj) !== false; } catch (_) { return false; }
+  }
+
+  handleDuelMessage(msg) {
+    if (!msg || typeof msg !== 'object') return;
+    switch (msg.t) {
+      case 'st':
+        if (this.mode === 'duel-guest') this.applySnapshot(msg);
+        break;
+      case 'ev':
+        if (this.mode === 'duel-guest') this.handleDuelEvent(msg);
+        break;
+      case 'in':
+        if (this.mode === 'duel-host') this.remoteInput = normInput(msg.k);
+        break;
+      case 'hi':
+        if (this.mode === 'duel-host') this.netSend({ t: 'hello', role: 'host', scene: this.duelScene });
+        break;
+      case 'req':
+        if (this.mode === 'duel-host') this.handleDuelRequest(msg);
+        break;
+      case 'bye':
+        this.onDuelPeerLeave();
+        break;
+      default:
+        break;
+    }
+  }
+
+  // 客机→主机的控制请求（重开/暂停）。协议表格外的唯一扩展，双方 game.js 共同实现。
+  handleDuelRequest(msg) {
+    if (msg.kind === 'restart') {
+      if (this.state !== 'over') return;
+      this.resetDuelMatch();
+      this.sendSnapshot();
+    } else if (msg.kind === 'pause') {
+      this.togglePause();
+    }
+  }
+
+  onDuelPeerLeave() {
+    if (this.mode === 'solo' || this.state === 'over') return;
+    this.state = 'over';
+    this.duelWinner = null;
+    this.duelNotice = '对手已断开';
+    this.duelNoticeT = 3;
+  }
+
+  readLocalKeys() {
+    const k = this.keys;
+    return {
+      u: (k['ArrowUp'] || k['KeyW']) ? 1 : 0,
+      d: (k['ArrowDown'] || k['KeyS']) ? 1 : 0,
+      l: (k['ArrowLeft'] || k['KeyA']) ? 1 : 0,
+      r: (k['ArrowRight'] || k['KeyD']) ? 1 : 0,
+      f: (k['Space'] || k['KeyJ']) ? 1 : 0
+    };
+  }
+
+  // ---------------- 主机：物理模拟 ----------------
+  applyInputToTank(tank, k, dt) {
+    if (!tank || !tank.alive) return;
+    const kk = k || { u: 0, d: 0, l: 0, r: 0, f: 0 };
+    let moved = false;
+    if (kk.u) { tank.dir = 'up'; moved = true; }
+    else if (kk.d) { tank.dir = 'down'; moved = true; }
+    else if (kk.l) { tank.dir = 'left'; moved = true; }
+    else if (kk.r) { tank.dir = 'right'; moved = true; }
+
+    if (moved) {
+      const v = DIR_VEC[tank.dir];
+      this.moveTank(tank, v.x * tank.speed * dt, v.y * tank.speed * dt);
+    }
+    if (kk.f) this.duelFire(tank);
+  }
+
+  duelFire(tank) {
+    const before = this.bullets.length;
+    this.fire(tank);
+    if (this.bullets.length > before) {
+      this.netSend({ t: 'ev', kind: 'fire', x: tank.x + tank.w / 2, y: tank.y + tank.h / 2 });
+    }
+  }
+
+  updateDuelHost(dt) {
+    if (!this.tanks) this.ensureDuelTanks();
+    this.tickDuelTimers(dt);
+    this.updateExplosions(dt);
+
+    if (this.state === 'playing') {
+      for (const t of this.tanks) {
+        if (!t) continue;
+        if (t.invincible > 0) t.invincible -= dt;
+        if (t.fireCooldown > 0) t.fireCooldown -= dt;
+      }
+      this.applyInputToTank(this.tanks[0], this.readLocalKeys(), dt);
+      this.applyInputToTank(this.tanks[1], this.remoteInput, dt);
+      this.updateDuelBullets(dt);
+    }
+
+    this.netAcc += dt;
+    if (this.netAcc >= SNAPSHOT_INTERVAL) {
+      this.netAcc = 0;
+      this.sendSnapshot();
+    }
+  }
+
+  updateDuelBullets(dt) {
+    for (let i = 0; i < this.bullets.length; i++) {
+      const b = this.bullets[i];
+      if (!b.alive) continue;
+      const v = DIR_VEC[b.dir];
+      b.x += v.x * b.speed * dt;
+      b.y += v.y * b.speed * dt;
+
+      if (b.x < 0 || b.x > WIDTH || b.y < 0 || b.y > HEIGHT) {
+        b.alive = false;
+        continue;
+      }
+
+      const c1 = Math.floor(b.x / TILE);
+      const c2 = Math.floor((b.x + b.w - 1) / TILE);
+      const r1 = Math.floor(b.y / TILE);
+      const r2 = Math.floor((b.y + b.h - 1) / TILE);
+      let hitWall = false;
+      for (let r = r1; r <= r2 && !hitWall; r++) {
+        for (let c = c1; c <= c2 && !hitWall; c++) {
+          if (r < 0 || r >= ROWS || c < 0 || c >= COLS) { hitWall = true; break; }
+          const tile = this.map[r][c];
+          if (tile === TILE_BRICK) { this.map[r][c] = TILE_EMPTY; hitWall = true; }
+          else if (tile === TILE_STEEL || tile === TILE_BASE || tile === TILE_BASE_RUIN) hitWall = true;
+        }
+      }
+      if (hitWall) { b.alive = false; continue; }
+
+      let hitTank = null;
+      const brect = { x: b.x, y: b.y, w: b.w, h: b.h };
+      for (const t of this.tanks) {
+        if (!t || !t.alive || t === b.owner || t.invincible > 0) continue;
+        if (rectsOverlap(brect, t.rect)) { hitTank = t; break; }
+      }
+      if (hitTank) {
+        b.alive = false;
+        this.duelHit(hitTank);
+        break; // 地图与坦克已复位，本帧不再处理剩余子弹
+      }
+    }
+    this.bullets = this.bullets.filter((b) => b.alive);
+  }
+
+  duelHit(tank) {
+    const side = tank.side;
+    const cx = tank.x + tank.w / 2;
+    const cy = tank.y + tank.h / 2;
+    this.addExplosion(cx, cy);
+    this.sfx.play('explosion');
+    this.netSend({ t: 'ev', kind: 'explosion', x: cx, y: cy });
+
+    this.duelLives[side] = Math.max(0, this.duelLives[side] - 1);
+
+    if (this.duelLives[side] <= 0) {
+      this.state = 'over';
+      this.duelWinner = 1 - side;
+      this.duelNotice = '';
+      this.duelNoticeT = 0;
+      this.sendSnapshot();
+      return;
+    }
+
+    // 换场景：scene+1 → 重新生成地图 → 双方复位并短暂无敌
+    this.duelScene++;
+    this.duelMapRev++;
+    this.map = this.generateMap(this.duelScene);
+    this.bullets = [];
+    this.resetDuelTanks();
+    this.duelNotice = '换 场 景';
+    this.duelNoticeT = DUEL_NOTICE_TIME;
+    this.sendSnapshot();
+  }
+
+  // ---------------- 客机：只渲染 ----------------
+  updateDuelGuest(dt) {
+    if (!this.tanks) this.ensureDuelTanks();
+    this.tickDuelTimers(dt);
+    this.updateExplosions(dt);
+    if (this.state !== 'playing') return;
+
+    this.inputAcc += dt;
+    if (this.inputAcc >= INPUT_INTERVAL) {
+      this.inputAcc = 0;
+      this.inputSeq++;
+      this.netSend({ t: 'in', k: this.readLocalKeys(), seq: this.inputSeq });
+    }
+  }
+
+  applySnapshot(st) {
+    if (!st || !Array.isArray(st.players)) return;
+
+    if (typeof st.scene === 'number' && st.scene !== this.duelScene) {
+      this.duelScene = st.scene;
+      this.map = this.generateMap(this.duelScene);
+      this.duelNotice = '换 场 景';
+      this.duelNoticeT = DUEL_NOTICE_TIME;
+    }
+    if (typeof st.mapRev === 'number') this.duelMapRev = st.mapRev;
+
+    for (let i = 0; i < 2; i++) {
+      const p = st.players[i];
+      const t = this.tanks && this.tanks[i];
+      if (!p || !t) continue;
+      t.x = p.x;
+      t.y = p.y;
+      if (p.dir) t.dir = p.dir;
+      t.alive = !!p.alive;
+      t.invincible = typeof p.inv === 'number' ? p.inv : 0;
+      t.fireCooldown = typeof p.cd === 'number' ? p.cd : 0;
+    }
+
+    this.bullets = (st.bullets || []).map((b) => ({
+      x: b.x, y: b.y, w: BULLET_SIZE, h: BULLET_SIZE, dir: b.dir, alive: true
+    }));
+
+    if (Array.isArray(st.lives)) this.duelLives = [st.lives[0] | 0, st.lives[1] | 0];
+    if (st.state) this.state = st.state;
+    this.duelWinner = (st.winner === 0 || st.winner === 1) ? st.winner : null;
+  }
+
+  handleDuelEvent(ev) {
+    if (!ev || typeof ev !== 'object') return;
+    if (ev.kind === 'fire') {
+      this.sfx.play('fire');
+    } else if (ev.kind === 'explosion' || ev.kind === 'hit') {
+      if (typeof ev.x === 'number' && typeof ev.y === 'number') this.addExplosion(ev.x, ev.y);
+      this.sfx.play(ev.kind === 'hit' ? 'hit' : 'explosion');
+    }
+  }
+
+  buildSnapshot() {
+    return {
+      t: 'st',
+      scene: this.duelScene,
+      mapRev: this.duelMapRev,
+      players: (this.tanks || []).map((t) => ({
+        x: t.x,
+        y: t.y,
+        dir: t.dir,
+        alive: !!t.alive,
+        inv: Math.max(0, t.invincible),
+        cd: Math.max(0, t.fireCooldown)
+      })),
+      bullets: this.bullets.map((b) => ({ x: b.x, y: b.y, dir: b.dir })),
+      lives: [this.duelLives[0], this.duelLives[1]],
+      state: this.state,
+      winner: this.duelWinner
+    };
+  }
+
+  sendSnapshot() {
+    if (this.mode !== 'duel-host') return;
+    this.netSend(this.buildSnapshot());
+  }
+
+  // ---------------- 双人模式的暂停/重开 ----------------
+  togglePause() {
+    if (this.mode === 'duel-guest') {
+      this.netSend({ t: 'req', kind: 'pause' });
+      return;
+    }
+    if (this.mode === 'duel-host') {
+      if (this.state === 'playing') this.state = 'paused';
+      else if (this.state === 'paused') this.state = 'playing';
+      else return;
+      this.sendSnapshot();
+      return;
+    }
+    if (this.state === 'playing') this.state = 'paused';
+    else if (this.state === 'paused') this.state = 'playing';
+  }
+
+  handleRestart() {
+    if (this.mode !== 'solo') {
+      if (this.state === 'over') this.restartDuel();
+      return;
+    }
+    if (this.state === 'paused' || this.state === 'gameover' || this.state === 'win') this.startGame();
+  }
+
+  restartDuel() {
+    if (this.mode === 'duel-guest') {
+      this.netSend({ t: 'req', kind: 'restart' });
+      this.duelNotice = '等待主机重开';
+      this.duelNoticeT = 1.5;
+      return;
+    }
+    this.resetDuelMatch();
+    this.sendSnapshot();
+  }
+
+  tickDuelTimers(dt) {
+    if (this.duelNoticeT > 0) this.duelNoticeT = Math.max(0, this.duelNoticeT - dt);
+  }
+
+  // ---------------- 双人模式渲染 ----------------
+  renderDuel() {
+    this.renderMap();
+    this.renderExplosions();
+    for (const b of this.bullets) this.renderBullet(b);
+    for (const t of this.tanks) if (t && t.alive) this.renderTank(t);
+    this.renderDuelHUD();
+    if (this.duelNoticeT > 0) this.renderDuelNotice();
+    if (this.state === 'paused') this.renderPause();
+    else if (this.state === 'over') this.renderDuelOver();
+    this.syncTouchButtons();
+  }
+
+  renderDuelHUD() {
+    const ctx = this.ctx;
+    ctx.fillStyle = 'rgba(0,0,0,0.55)';
+    ctx.fillRect(0, 0, WIDTH, 28);
+    ctx.font = 'bold 16px Consolas, monospace';
+    ctx.textBaseline = 'middle';
+    ctx.textAlign = 'left';
+
+    ctx.fillStyle = COLORS.hud;
+    ctx.fillText(`场景 ${this.duelScene}`, 12, 14);
+
+    const me = this.localSide;
+    const foe = 1 - me;
+    const hearts = (n) => '♥'.repeat(Math.max(0, n)) + '♡'.repeat(Math.max(0, DUEL_LIVES - n));
+
+    ctx.fillStyle = COLORS.player;
+    ctx.fillText(`你 ${hearts(this.duelLives[me])}`, 150, 14);
+    ctx.fillStyle = COLORS.enemy;
+    ctx.fillText(`对手 ${hearts(this.duelLives[foe])}`, 350, 14);
+
+    ctx.fillStyle = COLORS.hud;
+    ctx.fillText(this.mode === 'duel-host' ? '主机' : '客机', 660, 14);
+  }
+
+  renderDuelNotice() {
+    const ctx = this.ctx;
+    ctx.save();
+    ctx.globalAlpha = Math.min(1, this.duelNoticeT / 0.4);
+    ctx.fillStyle = 'rgba(0,0,0,0.5)';
+    ctx.fillRect(0, HEIGHT / 2 - 40, WIDTH, 80);
+    ctx.fillStyle = COLORS.bullet;
+    ctx.font = 'bold 40px Consolas, monospace';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(this.duelNotice, WIDTH / 2, HEIGHT / 2);
+    ctx.restore();
+    ctx.textAlign = 'left';
+  }
+
+  renderDuelOver() {
+    const ctx = this.ctx;
+    ctx.fillStyle = COLORS.overlayBg;
+    ctx.fillRect(0, 0, WIDTH, HEIGHT);
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+
+    let title = '对 战 结 束';
+    let color = '#fff';
+    if (this.duelWinner === this.localSide) { title = '胜 利'; color = COLORS.player; }
+    else if (this.duelWinner === 1 - this.localSide) { title = '失 败'; color = COLORS.enemy; }
+    else { title = '连 接 中 断'; color = COLORS.enemy; }
+
+    ctx.fillStyle = color;
+    ctx.font = 'bold 56px Consolas, monospace';
+    ctx.fillText(title, WIDTH / 2, HEIGHT / 2 - 60);
+
+    ctx.fillStyle = '#fff';
+    ctx.font = '22px Consolas, monospace';
+    if (this.duelWinner === null) {
+      ctx.fillText('请重新进入房间', WIDTH / 2, HEIGHT / 2 + 10);
+    } else {
+      const mine = this.duelLives[this.localSide];
+      const theirs = this.duelLives[1 - this.localSide];
+      ctx.fillText(`剩余生命  你 ${mine} : ${theirs} 对手`, WIDTH / 2, HEIGHT / 2 + 10);
+      ctx.fillStyle = COLORS.bullet;
+      ctx.font = '20px Consolas, monospace';
+      ctx.fillText(this.isTouch ? '点击右上重开按钮' : '按 R 重新开始', WIDTH / 2, HEIGHT / 2 + 55);
+    }
+    ctx.textAlign = 'left';
   }
 
   // ---------------- 主循环（deltaTime） ----------------

@@ -168,3 +168,84 @@ html, body {
   cursor: pointer;
   padding: 0 6px;
 }
+
+/* ==================== 双人对战大厅 ==================== */
+.lobby-hidden { display: none !important; }
+
+#lobby {
+  position: fixed;
+  inset: 0;
+  z-index: 30;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  pointer-events: none; /* 背景不拦截，触屏单人开局不受影响 */
+}
+
+#lobby-panel {
+  pointer-events: auto;
+  width: min(320px, 86vw);
+  padding: 22px 26px 18px;
+  background: rgba(10, 10, 22, 0.88);
+  border: 2px solid rgba(74, 222, 128, 0.55);
+  border-radius: 12px;
+  box-shadow: 0 0 24px rgba(0, 0, 0, 0.6);
+  text-align: center;
+  color: #e5e7eb;
+}
+
+#lobby-title {
+  font-size: 18px;
+  font-weight: bold;
+  color: #4ade80;
+  letter-spacing: 6px;
+  margin-bottom: 14px;
+}
+
+#room-input {
+  width: 100%;
+  padding: 10px 12px;
+  font-size: 22px;
+  font-family: inherit;
+  text-align: center;
+  letter-spacing: 8px;
+  color: #fde047;
+  background: #111827;
+  border: 2px solid rgba(255, 255, 255, 0.25);
+  border-radius: 8px;
+  outline: none;
+}
+#room-input:focus { border-color: #4ade80; }
+#room-input:disabled { opacity: 0.5; }
+
+#lobby-btns {
+  display: flex;
+  gap: 12px;
+  margin-top: 14px;
+}
+
+#btn-host, #btn-join {
+  flex: 1;
+  padding: 10px 0;
+  font-size: 16px;
+  font-weight: bold;
+  font-family: inherit;
+  border-radius: 8px;
+  border: 2px solid rgba(255, 255, 255, 0.5);
+  cursor: pointer;
+  touch-action: manipulation;
+}
+#btn-host { background: rgba(74, 222, 128, 0.22); color: #4ade80; }
+#btn-join { background: rgba(96, 165, 250, 0.22); color: #93c5fd; }
+#btn-host:active { background: rgba(74, 222, 128, 0.45); }
+#btn-join:active { background: rgba(96, 165, 250, 0.45); }
+#btn-host:disabled, #btn-join:disabled { opacity: 0.45; cursor: default; }
+
+#net-status {
+  margin-top: 12px;
+  min-height: 20px;
+  font-size: 13px;
+  line-height: 1.5;
+  color: #fbbf24;
+  word-break: break-all;
+}
