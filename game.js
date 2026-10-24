@@ -24,6 +24,16 @@ const MAX_LEVEL = 5;         // 通关总关卡数
 
 const HIGH_SCORE_KEY = 'tank-battle-highscore';
 
+const POWERUP_DROP_CHANCE = 0.2;
+const POWERUP_SIZE = 24;
+const POWERUP_TYPES = ['shield', 'speed', 'supply'];
+const SHIELD_DURATION = 5;
+const SPEED_DURATION = 8;
+const SPEED_MULTIPLIER = 1.3;
+const MAX_LIVES = 5;
+const POWERUP_COLORS = { shield: '#60a5fa', speed: '#fbbf24', supply: '#34d399' };
+const POWERUP_LABELS = { shield: '护盾', speed: '加速', supply: '补给' };
+
 const TILE_EMPTY = 0;
 const TILE_BRICK = 1;
 const TILE_STEEL = 2;
@@ -121,6 +131,7 @@ class Sfx {
     else if (kind === 'explosion') this.explosion(t);
     else if (kind === 'hit') this.hit(t);
     else if (kind === 'clear') this.clear(t);
+    else if (kind === 'powerup') this.powerup(t);
   }
 
   // 单个振荡器音：type 波形，freq 起始频率，freqEnd 终止频率（可省）
@@ -168,6 +179,11 @@ class Sfx {
   clear(t) {
     const notes = [523.25, 659.25, 783.99, 1046.5];
     notes.forEach((f, i) => this.tone('triangle', f, t + i * 0.11, 0.16, 0.2));
+  }
+
+  powerup(t) {
+    this.tone('sine', 880, t, 0.12, 0.18, 1760);
+    this.tone('triangle', 1320, t + 0.08, 0.1, 0.14, 2640);
   }
 }
 
@@ -227,6 +243,9 @@ class Game {
     this.enemies = [];
     this.bullets = [];
     this.explosions = [];
+
+    this.powerups = [];
+    this.activeEffects = { shield: 0, speed: 0 };
 
     this.enemiesToSpawn = 0;  // 本关剩余待生成敌人数
     this.enemiesAlive = 0;    // 当前场上敌人数
@@ -348,6 +367,8 @@ class Game {
     this.enemies = [];
     this.bullets = [];
     this.explosions = [];
+    this.powerups = [];
+    this.activeEffects = { shield: 0, speed: 0 };
     this.baseFlashTimer = 0;
     this.baseWarn = false;
 
@@ -450,7 +471,9 @@ class Game {
     const cy = tank.y + tank.h / 2;
     const bx = cx - BULLET_SIZE / 2 + v.x * (tank.w / 2);
     const by = cy - BULLET_SIZE / 2 + v.y * (tank.h / 2);
-    this.bullets.push(new Bullet(bx, by, tank.dir, tank));
+    const bullet = new Bullet(bx, by, tank.dir, tank);
+    bullet.speed = (!tank.isPlayer && this.level >= 4) ? BULLET_SPEED * 1.1 : BULLET_SPEED;
+    this.bullets.push(bullet);
     tank.fireCooldown = tank.isPlayer ? 0.25 : 0.5;
     this.sfx.play('fire');
   }
@@ -465,6 +488,7 @@ class Game {
     this.updateEnemies(dt);
     this.updateBullets(dt);
     this.updateExplosions(dt);
+    this.updatePowerUps(dt);
     this.updateSpawning(dt);
     this.checkBaseWarning(dt);
     this.checkLevelClear();
@@ -500,7 +524,8 @@ class Game {
 
     if (moved) {
       const v = DIR_VEC[p.dir];
-      this.moveTank(p, v.x * p.speed * dt, v.y * p.speed * dt);
+      const spd = this.activeEffects.speed > 0 ? p.speed * SPEED_MULTIPLIER : p.speed;
+      this.moveTank(p, v.x * spd * dt, v.y * spd * dt);
     }
     if (this.keys['Space'] || this.keys['KeyJ']) this.fire(p);
   }
@@ -511,30 +536,19 @@ class Game {
       if (e.fireCooldown > 0) e.fireCooldown -= dt;
       if (e.spawnFlash > 0) e.spawnFlash -= dt;
 
-      // AI 转向计时
       e.aiTurnTimer -= dt;
       if (e.aiTurnTimer <= 0) {
         e.aiTurnTimer = 0.6 + Math.random() * 1.4;
-        // 40% 概率朝向玩家方向偏移
-        if (this.player && Math.random() < 0.4) {
-          const dx = this.player.x - e.x;
-          const dy = this.player.y - e.y;
-          if (Math.abs(dx) > Math.abs(dy)) e.dir = dx > 0 ? 'right' : 'left';
-          else e.dir = dy > 0 ? 'down' : 'up';
-        } else {
-          e.dir = DIR_ORDER[Math.floor(Math.random() * 4)];
-        }
+        e.dir = this.chooseEnemyDir(e);
       }
 
       const v = DIR_VEC[e.dir];
       const before = { x: e.x, y: e.y };
       this.moveTank(e, v.x * e.speed * dt, v.y * e.speed * dt);
-      // 撞墙/撞坦克则立即换方向
       if (e.x === before.x && e.y === before.y) {
         e.aiTurnTimer = 0;
       }
 
-      // AI 开火
       e.aiFireTimer -= dt;
       if (e.aiFireTimer <= 0) {
         e.aiFireTimer = 1.5 + Math.random() * 1.5;
@@ -543,12 +557,68 @@ class Game {
     }
   }
 
+  chooseEnemyDir(e) {
+    const candidates = [];
+    const ex = e.x + e.w / 2;
+    const ey = e.y + e.h / 2;
+    const ec = ex / TILE;
+    const er = ey / TILE;
+
+    const bcx = 9.5, bcy = 13;
+    const distToBase = Math.sqrt((ec - bcx) ** 2 + (er - bcy) ** 2);
+
+    if (distToBase <= 5) {
+      const dx = bcx * TILE - ex;
+      const dy = bcy * TILE - ey;
+      if (Math.abs(dx) > Math.abs(dy)) {
+        candidates.push(dx > 0 ? 'right' : 'left');
+        candidates.push(dy > 0 ? 'down' : 'up');
+      } else {
+        candidates.push(dy > 0 ? 'down' : 'up');
+        candidates.push(dx > 0 ? 'right' : 'left');
+      }
+    }
+
+    if (this.player && this.player.alive) {
+      const px = this.player.x + this.player.w / 2;
+      const py = this.player.y + this.player.h / 2;
+      const sameRow = Math.abs(ey - py) < TILE;
+      const sameCol = Math.abs(ex - px) < TILE;
+      if (sameRow || sameCol) {
+        const dx = px - ex;
+        const dy = py - ey;
+        if (Math.abs(dx) > Math.abs(dy)) {
+          candidates.push(dx > 0 ? 'right' : 'left');
+        } else {
+          candidates.push(dy > 0 ? 'down' : 'up');
+        }
+      }
+    }
+
+    const shuffled = [...DIR_ORDER].sort(() => Math.random() - 0.5);
+    for (const dir of shuffled) {
+      if (!candidates.includes(dir)) candidates.push(dir);
+    }
+
+    for (const dir of candidates) {
+      if (this.canEnemyMoveDir(e, dir)) return dir;
+    }
+    return e.dir;
+  }
+
+  canEnemyMoveDir(e, dir) {
+    const v = DIR_VEC[dir];
+    const step = TILE * 0.5;
+    const testRect = { x: e.x + v.x * step, y: e.y + v.y * step, w: e.w, h: e.h };
+    return !this.collidesWithWall(testRect) && !this.collidesWithTank(testRect, e);
+  }
+
   updateBullets(dt) {
     for (const b of this.bullets) {
       if (!b.alive) continue;
       const v = DIR_VEC[b.dir];
-      b.x += v.x * BULLET_SPEED * dt;
-      b.y += v.y * BULLET_SPEED * dt;
+      b.x += v.x * b.speed * dt;
+      b.y += v.y * b.speed * dt;
 
       // 越界
       if (b.x < 0 || b.x > WIDTH || b.y < 0 || b.y > HEIGHT) {
@@ -590,6 +660,12 @@ class Game {
             this.score += 100;
             this.addExplosion(e.x + e.w / 2, e.y + e.h / 2);
             this.sfx.play('explosion');
+            if (Math.random() < POWERUP_DROP_CHANCE) {
+              const type = POWERUP_TYPES[Math.floor(Math.random() * POWERUP_TYPES.length)];
+              const px = e.x + (e.w - POWERUP_SIZE) / 2;
+              const py = e.y + (e.h - POWERUP_SIZE) / 2;
+              this.powerups.push({ x: px, y: py, type, alive: true });
+            }
             break;
           }
         }
@@ -604,6 +680,20 @@ class Game {
     }
     this.bullets = this.bullets.filter((b) => b.alive);
     this.enemies = this.enemies.filter((e) => e.alive);
+
+    const p = this.player;
+    if (p && p.alive) {
+      for (const pu of this.powerups) {
+        if (!pu.alive) continue;
+        const puRect = { x: pu.x, y: pu.y, w: POWERUP_SIZE, h: POWERUP_SIZE };
+        if (rectsOverlap(p.rect, puRect)) {
+          pu.alive = false;
+          this.applyPowerUp(pu.type);
+          this.sfx.play('powerup');
+        }
+      }
+    }
+    this.powerups = this.powerups.filter((pu) => pu.alive);
   }
 
   playerHit() {
@@ -655,7 +745,9 @@ class Game {
       this.spawnTimer -= dt;
       if (this.spawnTimer <= 0) {
         this.spawnEnemy();
-        this.spawnTimer = 1.5;
+        let interval = 1.5;
+        if (this.level >= 3) interval *= 0.8;
+        this.spawnTimer = interval;
       }
     }
   }
@@ -673,6 +765,32 @@ class Game {
     }
   }
 
+  updatePowerUps(dt) {
+    if (this.activeEffects.shield > 0) {
+      this.activeEffects.shield -= dt;
+      if (this.activeEffects.shield <= 0) this.activeEffects.shield = 0;
+    }
+    if (this.activeEffects.speed > 0) {
+      this.activeEffects.speed -= dt;
+      if (this.activeEffects.speed <= 0) this.activeEffects.speed = 0;
+    }
+    const p = this.player;
+    if (p && p.alive && this.activeEffects.shield > 0) {
+      p.invincible = Math.max(p.invincible, this.activeEffects.shield);
+    }
+  }
+
+  applyPowerUp(type) {
+    if (type === 'shield') {
+      this.activeEffects.shield = SHIELD_DURATION;
+      if (this.player) this.player.invincible = Math.max(this.player.invincible, SHIELD_DURATION);
+    } else if (type === 'speed') {
+      this.activeEffects.speed = SPEED_DURATION;
+    } else if (type === 'supply') {
+      if (this.lives < MAX_LIVES) this.lives++;
+    }
+  }
+
   // ---------------- 渲染 ----------------
   render() {
     const ctx = this.ctx;
@@ -686,6 +804,7 @@ class Game {
 
     this.renderMap();
     this.renderExplosions();
+    this.renderPowerUps();
     for (const b of this.bullets) this.renderBullet(b);
     for (const e of this.enemies) this.renderTank(e);
     if (this.player && this.player.alive) this.renderTank(this.player);
@@ -890,6 +1009,27 @@ class Game {
     }
   }
 
+  renderPowerUps() {
+    const ctx = this.ctx;
+    const blink = Math.floor(performance.now() / 200) % 2 === 0;
+    for (const pu of this.powerups) {
+      if (!pu.alive) continue;
+      const color = POWERUP_COLORS[pu.type] || '#fff';
+      ctx.fillStyle = blink ? color : '#ffffff';
+      ctx.fillRect(pu.x, pu.y, POWERUP_SIZE, POWERUP_SIZE);
+      ctx.strokeStyle = '#fff';
+      ctx.lineWidth = 1.5;
+      ctx.strokeRect(pu.x, pu.y, POWERUP_SIZE, POWERUP_SIZE);
+      ctx.fillStyle = '#000';
+      ctx.font = 'bold 11px Consolas, monospace';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      const label = pu.type === 'shield' ? 'S' : pu.type === 'speed' ? '>' : '+';
+      ctx.fillText(label, pu.x + POWERUP_SIZE / 2, pu.y + POWERUP_SIZE / 2);
+      ctx.textAlign = 'left';
+    }
+  }
+
   renderHUD() {
     const ctx = this.ctx;
     ctx.fillStyle = 'rgba(0,0,0,0.55)';
@@ -903,6 +1043,18 @@ class Game {
     ctx.fillText(`分数 ${this.score}`, 372, 14);
     ctx.fillText(`最高分 ${this.highScore}`, 500, 14);
     ctx.fillText(`音效 ${this.sfx.muted ? '关' : '开'}`, 690, 14);
+
+    const effects = [];
+    if (this.activeEffects.shield > 0) effects.push(`护盾 ${this.activeEffects.shield.toFixed(1)}s`);
+    if (this.activeEffects.speed > 0) effects.push(`加速 ${this.activeEffects.speed.toFixed(1)}s`);
+    const effectText = effects.length > 0 ? effects.join('  ') : '无';
+    ctx.fillStyle = 'rgba(0,0,0,0.45)';
+    ctx.fillRect(0, HEIGHT - 22, WIDTH, 22);
+    ctx.fillStyle = this.activeEffects.shield > 0 ? POWERUP_COLORS.shield :
+                    this.activeEffects.speed > 0 ? POWERUP_COLORS.speed : '#888';
+    ctx.font = 'bold 13px Consolas, monospace';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(`效果: ${effectText}`, 12, HEIGHT - 11);
   }
 
   renderStart() {
