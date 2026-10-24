@@ -26,6 +26,8 @@ const HIGH_SCORE_KEY = 'tank-battle-highscore';
 
 const POWERUP_DROP_CHANCE = 0.2;
 const POWERUP_SIZE = 24;
+const POWERUP_TTL = 12;            // 道具存在秒数，避免不可达道具堆积
+const MAX_POWERUPS_ON_MAP = 6;     // 同屏道具上限
 const POWERUP_TYPES = ['shield', 'speed', 'supply'];
 const SHIELD_DURATION = 5;
 const SPEED_DURATION = 8;
@@ -88,6 +90,7 @@ class Sfx {
     this.master = null;
     this.noise = null;
     this.muted = false;
+    this.lastPlay = {};   // 同类音效限流用
   }
 
   // 创建 / 恢复音频上下文：只在首次用户交互之后调用
@@ -125,8 +128,12 @@ class Sfx {
 
   play(kind) {
     if (this.muted) return;
-    if (!this.unlock()) return;
+    // 只在首次真正创建上下文时解锁；避免每次播放都走一遍 unlock/resume
+    if (!this.ctx && !this.unlock()) return;
     const t = this.ctx.currentTime;
+    // 同类音效 40ms 内不重复：连发/连拾取时不会一次创建大量音频节点
+    if (t - (this.lastPlay[kind] || -1) < 0.04) return;
+    this.lastPlay[kind] = t;
     if (kind === 'fire') this.fire(t);
     else if (kind === 'explosion') this.explosion(t);
     else if (kind === 'hit') this.hit(t);
@@ -246,6 +253,11 @@ class Game {
 
     this.powerups = [];
     this.activeEffects = { shield: 0, speed: 0 };
+    // HUD 效果条文案缓存：只在显示值变化时重建，避免每帧分配字符串
+    this._hudEffectText = '无';
+    this._hudEffectColor = '#888';
+    this._hudShieldTenth = 0;
+    this._hudSpeedTenth = 0;
 
     this.enemiesToSpawn = 0;  // 本关剩余待生成敌人数
     this.enemiesAlive = 0;    // 当前场上敌人数
@@ -441,21 +453,26 @@ class Game {
   }
 
   // 尝试移动坦克（分轴检测，支持贴墙滑动）
+  // 子步进移动：加速道具下位移变大时仍逐段检测碰撞，
+  // 避免"整步被墙拒绝 → 原地顿一下"的抖动
   moveTank(tank, dx, dy) {
-    if (dx !== 0) {
-      const nx = tank.x + dx;
-      const rect = { x: nx, y: tank.y, w: tank.w, h: tank.h };
-      if (!this.collidesWithWall(rect) && !this.collidesWithTank(rect, tank)) {
-        tank.x = nx;
+    const MAX_STEP = 2; // 每个子步最多 2px
+    const substep = (axis, delta) => {
+      if (!delta) return;
+      const sign = delta > 0 ? 1 : -1;
+      let remain = Math.abs(delta);
+      while (remain > 0.0001) {
+        const d = Math.min(MAX_STEP, remain) * sign;
+        const rect = axis === 'x'
+          ? { x: tank.x + d, y: tank.y, w: tank.w, h: tank.h }
+          : { x: tank.x, y: tank.y + d, w: tank.w, h: tank.h };
+        if (this.collidesWithWall(rect) || this.collidesWithTank(rect, tank)) break;
+        if (axis === 'x') tank.x += d; else tank.y += d;
+        remain -= Math.abs(d);
       }
-    }
-    if (dy !== 0) {
-      const ny = tank.y + dy;
-      const rect = { x: tank.x, y: ny, w: tank.w, h: tank.h };
-      if (!this.collidesWithWall(rect) && !this.collidesWithTank(rect, tank)) {
-        tank.y = ny;
-      }
-    }
+    };
+    substep('x', dx);
+    substep('y', dy);
   }
 
   // ---------------- 发射子弹 ----------------
@@ -664,7 +681,9 @@ class Game {
               const type = POWERUP_TYPES[Math.floor(Math.random() * POWERUP_TYPES.length)];
               const px = e.x + (e.w - POWERUP_SIZE) / 2;
               const py = e.y + (e.h - POWERUP_SIZE) / 2;
-              this.powerups.push({ x: px, y: py, type, alive: true });
+              if (this.powerups.length < MAX_POWERUPS_ON_MAP) {
+                this.powerups.push({ x: px, y: py, type, alive: true, ttl: POWERUP_TTL });
+              }
             }
             break;
           }
@@ -777,6 +796,29 @@ class Game {
     const p = this.player;
     if (p && p.alive && this.activeEffects.shield > 0) {
       p.invincible = Math.max(p.invincible, this.activeEffects.shield);
+    }
+
+    // 道具超时消失，避免打不到的道具长期堆积、每帧重复绘制
+    for (const pu of this.powerups) {
+      if (!pu.alive) continue;
+      if (typeof pu.ttl === 'number') {
+        pu.ttl -= dt;
+        if (pu.ttl <= 0) pu.alive = false;
+      }
+    }
+    if (this.powerups.some((pu) => !pu.alive)) this.powerups = this.powerups.filter((pu) => pu.alive);
+
+    // HUD 文案只在显示值变化时重建（按 0.1s 粒度）
+    const st = Math.max(0, Math.ceil(this.activeEffects.shield * 10));
+    const sp = Math.max(0, Math.ceil(this.activeEffects.speed * 10));
+    if (st !== this._hudShieldTenth || sp !== this._hudSpeedTenth) {
+      this._hudShieldTenth = st;
+      this._hudSpeedTenth = sp;
+      const parts = [];
+      if (st > 0) parts.push(`护盾 ${(st / 10).toFixed(1)}s`);
+      if (sp > 0) parts.push(`加速 ${(sp / 10).toFixed(1)}s`);
+      this._hudEffectText = parts.length ? parts.join('  ') : '无';
+      this._hudEffectColor = st > 0 ? POWERUP_COLORS.shield : (sp > 0 ? POWERUP_COLORS.speed : '#888');
     }
   }
 
@@ -953,8 +995,13 @@ class Game {
 
   renderTank(tank) {
     const ctx = this.ctx;
-    // 无敌闪烁
-    if (tank.isPlayer && tank.invincible > 0 && Math.floor(tank.invincible * 10) % 2 === 0) return;
+    // 无敌：柔和透明度脉动，代替"整帧不画"的硬闪烁
+    // （硬闪烁在 5 秒护盾下每秒明灭 5 次，看起来就像卡顿）
+    const blink = tank.isPlayer && tank.invincible > 0;
+    if (blink) {
+      ctx.save();
+      ctx.globalAlpha = 0.45 + 0.55 * (0.5 + 0.5 * Math.sin(tank.invincible * 14));
+    }
 
     const main = tank.isPlayer ? COLORS.player : COLORS.enemy;
     const dark = tank.isPlayer ? COLORS.playerDark : COLORS.enemyDark;
@@ -990,6 +1037,8 @@ class Game {
     else if (dir === 'down') ctx.fillRect(cx - bw / 2, cy, bw, bl);
     else if (dir === 'left') ctx.fillRect(cx - bl, cy - bw / 2, bl, bw);
     else ctx.fillRect(cx, cy - bw / 2, bl, bw);
+
+    if (blink) ctx.restore();
   }
 
   renderBullet(b) {
@@ -1011,9 +1060,16 @@ class Game {
 
   renderPowerUps() {
     const ctx = this.ctx;
-    const blink = Math.floor(performance.now() / 200) % 2 === 0;
+    // 0.4s 一次明暗交替（原来 0.2s，视觉上过闪）
+    const blink = Math.floor(performance.now() / 400) % 2 === 0;
     for (const pu of this.powerups) {
       if (!pu.alive) continue;
+      // 最后 3 秒淡出提示即将消失
+      const expiring = typeof pu.ttl === 'number' && pu.ttl < 3;
+      if (expiring) {
+        ctx.save();
+        ctx.globalAlpha = 0.35 + 0.65 * (blink ? 1 : 0.45);
+      }
       const color = POWERUP_COLORS[pu.type] || '#fff';
       ctx.fillStyle = blink ? color : '#ffffff';
       ctx.fillRect(pu.x, pu.y, POWERUP_SIZE, POWERUP_SIZE);
@@ -1027,6 +1083,7 @@ class Game {
       const label = pu.type === 'shield' ? 'S' : pu.type === 'speed' ? '>' : '+';
       ctx.fillText(label, pu.x + POWERUP_SIZE / 2, pu.y + POWERUP_SIZE / 2);
       ctx.textAlign = 'left';
+      if (expiring) ctx.restore();
     }
   }
 
@@ -1044,17 +1101,12 @@ class Game {
     ctx.fillText(`最高分 ${this.highScore}`, 500, 14);
     ctx.fillText(`音效 ${this.sfx.muted ? '关' : '开'}`, 690, 14);
 
-    const effects = [];
-    if (this.activeEffects.shield > 0) effects.push(`护盾 ${this.activeEffects.shield.toFixed(1)}s`);
-    if (this.activeEffects.speed > 0) effects.push(`加速 ${this.activeEffects.speed.toFixed(1)}s`);
-    const effectText = effects.length > 0 ? effects.join('  ') : '无';
     ctx.fillStyle = 'rgba(0,0,0,0.45)';
     ctx.fillRect(0, HEIGHT - 22, WIDTH, 22);
-    ctx.fillStyle = this.activeEffects.shield > 0 ? POWERUP_COLORS.shield :
-                    this.activeEffects.speed > 0 ? POWERUP_COLORS.speed : '#888';
+    ctx.fillStyle = this._hudEffectColor;
     ctx.font = 'bold 13px Consolas, monospace';
     ctx.textBaseline = 'middle';
-    ctx.fillText(`效果: ${effectText}`, 12, HEIGHT - 11);
+    ctx.fillText(`效果: ${this._hudEffectText}`, 12, HEIGHT - 11);
   }
 
   renderStart() {
