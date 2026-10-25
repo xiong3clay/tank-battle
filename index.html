@@ -18,13 +18,39 @@
   <button id="lobby-toggle" type="button">双人对战</button>
   <div id="lobby-panel" class="lobby-collapsed">
     <div id="lobby-title">双人对战 <span id="lobby-close" title="收起">×</span></div>
-    <input id="room-input" type="text" inputmode="numeric" maxlength="6" pattern="\d{6}"
-           placeholder="6 位房间号" autocomplete="off">
-    <div id="lobby-btns">
-      <button id="btn-host" type="button">开房间</button>
-      <button id="btn-join" type="button">加入房间</button>
+    <div id="lobby-modes">
+      <button id="mode-online" type="button" class="mode-tab mode-active">联网开房</button>
+      <button id="mode-manual" type="button" class="mode-tab">离线配对</button>
     </div>
-    <div id="net-status"></div>
+
+    <div id="online-pane">
+      <input id="room-input" type="text" inputmode="numeric" maxlength="6" pattern="\d{6}"
+             placeholder="6 位房间号" autocomplete="off">
+      <div id="lobby-btns">
+        <button id="btn-host" type="button">开房间</button>
+        <button id="btn-join" type="button">加入房间</button>
+      </div>
+      <div id="net-status"></div>
+    </div>
+
+    <div id="manual-pane" class="lobby-hidden">
+      <button id="btn-make-invite" type="button" class="manual-btn">生成邀请码（主机）</button>
+      <div class="manual-label">自己生成的码（复制发给对方）</div>
+      <textarea id="manual-out" wrap="off" readonly
+                placeholder="生成的邀请码 / 应答码会显示在这里"></textarea>
+      <button id="btn-copy" type="button" class="manual-btn">复制</button>
+
+      <div class="manual-label">客机：把对方发来的邀请码粘到这里</div>
+      <textarea id="manual-in-invite" wrap="off" placeholder="粘贴邀请码"></textarea>
+      <button id="btn-use-invite" type="button" class="manual-btn">用邀请码生成应答码（客机）</button>
+
+      <div class="manual-label">主机：把对方发回的应答码粘到这里</div>
+      <textarea id="manual-in-answer" wrap="off" placeholder="粘贴应答码"></textarea>
+      <button id="btn-accept-answer" type="button" class="manual-btn">完成连接（主机）</button>
+
+      <div id="manual-status"></div>
+    </div>
+
     <div id="lobby-hint">单人游戏：按任意键直接开始</div>
   </div>
 </div>
@@ -49,14 +75,26 @@
 <script src="net.js"></script>
 <script src="game.js"></script>
 <script>
-/* 大厅交互：联机模块缺失时降级为提示，绝不影响单人模式 */
+/* 大厅交互：联网开房 + 离线配对（复制粘贴邀请码）。任何异常都不影响单人模式 */
 (function () {
   'use strict';
   function $(id) { return document.getElementById(id); }
   var lobby = $('lobby'), input = $('room-input'),
       btnHost = $('btn-host'), btnJoin = $('btn-join'), statusEl = $('net-status'),
-      panel = $('lobby-panel'), toggleBtn = $('lobby-toggle'), closeBtn = $('lobby-close');
+      panel = $('lobby-panel'), toggleBtn = $('lobby-toggle'), closeBtn = $('lobby-close'),
+      modeOnline = $('mode-online'), modeManual = $('mode-manual'),
+      onlinePane = $('online-pane'), manualPane = $('manual-pane'),
+      btnMakeInvite = $('btn-make-invite'), btnUseInvite = $('btn-use-invite'),
+      btnAcceptAnswer = $('btn-accept-answer'), btnCopy = $('btn-copy'),
+      inInvite = $('manual-in-invite'), inAnswer = $('manual-in-answer'),
+      outCode = $('manual-out'), manualStatusEl = $('manual-status');
   if (!lobby || !input || !btnHost || !btnJoin || !statusEl) return;
+
+  // 面板内按键不冒泡，避免打字/空格触发游戏“任意键开始”
+  try {
+    panel.addEventListener('keydown', function (e) { e.stopPropagation(); });
+    panel.addEventListener('keyup', function (e) { e.stopPropagation(); });
+  } catch (e) {}
 
   // 大厅默认收起成右上角小按钮，点开才展开，避免遮挡开始界面的操作说明
   var expanded = false;
@@ -70,18 +108,65 @@
   setExpanded(false);
 
   function setStatus(msg) { statusEl.textContent = msg || ''; }
+  function setManualStatus(msg) { if (manualStatusEl) manualStatusEl.textContent = msg || ''; }
   function setBusy(busy) {
     btnHost.disabled = busy; btnJoin.disabled = busy; input.disabled = busy;
   }
+  function setManualBusy(busy) {
+    if (btnMakeInvite) btnMakeInvite.disabled = busy;
+    if (btnUseInvite) btnUseInvite.disabled = busy;
+    if (btnAcceptAnswer) btnAcceptAnswer.disabled = busy;
+  }
 
-  // 输入框按键不冒泡，避免打字触发游戏“任意键开始”
-  input.addEventListener('keydown', function (e) { e.stopPropagation(); });
-  input.addEventListener('keyup', function (e) { e.stopPropagation(); });
+  // ---------------- 模式切换：联网开房 / 离线配对 ----------------
+  var currentMode = 'online';
+  function setMode(m) {
+    currentMode = (m === 'manual') ? 'manual' : 'online';
+    var isManual = currentMode === 'manual';
+    if (onlinePane) onlinePane.classList.toggle('lobby-hidden', isManual);
+    if (manualPane) manualPane.classList.toggle('lobby-hidden', !isManual);
+    if (modeOnline) modeOnline.classList.toggle('mode-active', !isManual);
+    if (modeManual) modeManual.classList.toggle('mode-active', isManual);
+    if (panel) panel.classList.toggle('lobby-wide', isManual);
+  }
+  if (modeOnline) modeOnline.addEventListener('click', function () { setMode('online'); });
+  if (modeManual) modeManual.addEventListener('click', function () { setMode('manual'); });
+  setMode('online');
+
+  // 输入框只允许 6 位数字
   input.addEventListener('input', function () {
     input.value = input.value.replace(/\D/g, '').slice(0, 6);
   });
 
+  // ---------------- 复制（无剪贴板权限时降级，不报错） ----------------
+  function legacyCopy(text) {
+    try {
+      var ta = document.createElement('textarea');
+      ta.value = text;
+      ta.style.position = 'fixed';
+      ta.style.top = '-1000px';
+      ta.style.opacity = '0';
+      document.body.appendChild(ta);
+      ta.select();
+      var ok = false;
+      try { ok = document.execCommand('copy'); } catch (_) {}
+      document.body.removeChild(ta);
+      return !!ok;
+    } catch (e) { return false; }
+  }
+  function copyText(text) {
+    if (!text) return Promise.resolve(false);
+    try {
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        return navigator.clipboard.writeText(text).then(function () { return true; })
+          .catch(function () { return legacyCopy(text); });
+      }
+    } catch (e) {}
+    return Promise.resolve(legacyCopy(text));
+  }
+
   var duelStarted = false;
+  var hideForDuel = false;
 
   // 连接成功后进入对战；startDuel 可能尚未实现，判空并等它出现
   function tryStartDuel() {
@@ -102,8 +187,11 @@
   var Net = window.Net;
   if (!Net) {
     setBusy(true);
+    setManualBusy(true);
     setStatus('联机模块未加载，仅可单人游戏');
+    setManualStatus('联机模块未加载，仅可单人游戏');
   } else {
+    // ---- 联网开房（原逻辑保持不变） ----
     btnHost.addEventListener('click', function () {
       var code = readCode(); if (!code) return;
       duelStarted = false;
@@ -118,21 +206,101 @@
       setStatus('正在加入房间…');
       Net.join(code);
     });
+
+    // ---- 离线配对 ----
+    if (btnMakeInvite) btnMakeInvite.addEventListener('click', function () {
+      if (typeof Net.createInvite !== 'function') { setManualStatus('当前版本不支持离线配对'); return; }
+      duelStarted = false;
+      setManualBusy(true);
+      if (outCode) outCode.value = '';
+      setManualStatus('正在生成邀请码…');
+      Net.createInvite().then(function (code) {
+        if (outCode) outCode.value = code;
+        return copyText(code).then(function (ok) {
+          setManualBusy(false);
+          setManualStatus(ok
+            ? '邀请码已生成并已尝试复制。把它发给对方，等对方发回应答码后粘到下面的框里，再点「完成连接（主机）」。'
+            : '邀请码已生成，自动复制失败，请手动全选复制发给对方；收到应答码后粘到下面的框里，再点「完成连接（主机）」。');
+        });
+      }).catch(function (err) {
+        setManualBusy(false);
+        setManualStatus((err && err.message) || '生成邀请码失败，请重试');
+      });
+    });
+
+    if (btnUseInvite) btnUseInvite.addEventListener('click', function () {
+      if (typeof Net.useInvite !== 'function') { setManualStatus('当前版本不支持离线配对'); return; }
+      var code = inInvite ? inInvite.value.trim() : '';
+      if (!code) { setManualStatus('请先把对方发来的邀请码粘贴到上面的框里'); return; }
+      duelStarted = false;
+      setManualBusy(true);
+      if (outCode) outCode.value = '';
+      setManualStatus('正在根据邀请码生成应答码…');
+      Net.useInvite(code).then(function (answer) {
+        if (outCode) outCode.value = answer;
+        return copyText(answer).then(function (ok) {
+          setManualBusy(false);
+          setManualStatus(ok
+            ? '应答码已生成并已尝试复制。请把它发回给主机；主机点「完成连接」后双方会自动连上。'
+            : '应答码已生成，自动复制失败，请手动全选复制发回给主机；主机点「完成连接」后双方会自动连上。');
+        });
+      }).catch(function (err) {
+        setManualBusy(false);
+        setManualStatus((err && err.message) || '生成应答码失败，请确认邀请码已完整复制');
+      });
+    });
+
+    if (btnAcceptAnswer) btnAcceptAnswer.addEventListener('click', function () {
+      if (typeof Net.acceptAnswer !== 'function') { setManualStatus('当前版本不支持离线配对'); return; }
+      var code = inAnswer ? inAnswer.value.trim() : '';
+      if (!code) { setManualStatus('请先把对方发回的应答码粘贴到上面的框里'); return; }
+      setManualBusy(true);
+      setManualStatus('正在建立直连…');
+      Net.acceptAnswer(code).then(function () {
+        setManualBusy(false);
+        setManualStatus('连接成功，正在进入对战…');
+      }).catch(function (err) {
+        setManualBusy(false);
+        setManualStatus((err && err.message) || '连接失败，请重新生成邀请码再试');
+      });
+    });
+
+    if (btnCopy) btnCopy.addEventListener('click', function () {
+      var text = outCode ? outCode.value : '';
+      if (!text) { setManualStatus('还没有可复制的码，请先生成'); return; }
+      copyText(text).then(function (ok) {
+        setManualStatus(ok ? '已复制到剪贴板' : '复制失败（可能无剪贴板权限），请手动全选复制');
+      });
+    });
+
+    // ---- 公共事件 ----
     Net.on('peer', function () {
+      if (currentMode !== 'online') return;
       setStatus(Net.isHost ? '房间已创建，等待对方加入…' : '已连接服务器，正在加入…');
     });
     Net.on('open', function () {
-      setStatus('连接成功！正在进入对战…');
+      if (currentMode === 'manual') setManualStatus('连接成功，正在进入对战…');
+      else setStatus('连接成功！正在进入对战…');
+      hideForDuel = true;
+      setExpanded(false);
+      lobby.classList.add('lobby-hidden');
       tryStartDuel();
     });
     Net.on('error', function (err) {
+      var msg = (err && err.message) || '连接失败，请重试';
       setBusy(false);
-      setStatus((err && err.message) || '连接失败，请重试');
+      setManualBusy(false);
+      if (currentMode === 'manual') setManualStatus(msg);
+      else setStatus(msg);
     });
     Net.on('leave', function () {
       setBusy(false);
+      setManualBusy(false);
       duelStarted = false;
-      setStatus('连接已断开，可重新开房或加入');
+      hideForDuel = false;
+      var msg = '连接已断开，可重新开房或配对';
+      if (currentMode === 'manual') setManualStatus(msg);
+      else setStatus(msg);
     });
   }
 
@@ -141,7 +309,7 @@
     try {
       var g = window.__game;
       var inStart = !!(g && g.state === 'start');
-      lobby.classList.toggle('lobby-hidden', !inStart);
+      lobby.classList.toggle('lobby-hidden', !inStart || hideForDuel);
       if (inStart && !duelStarted && Net && Net.status() === 'connected') tryStartDuel();
     } catch (e) {}
   }, 200);

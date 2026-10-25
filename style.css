@@ -283,3 +283,108 @@ html, body {
   color: #6b7280;
   word-break: break-all;
 }
+
+/* ==================== 模式切换 & 离线配对 ==================== */
+#lobby-modes {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.mode-tab {
+  flex: 1;
+  padding: 6px 0;
+  font: inherit;
+  font-size: 13px;
+  font-weight: bold;
+  color: #9ca3af;
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  border-radius: 7px;
+  cursor: pointer;
+  touch-action: manipulation;
+}
+.mode-tab.mode-active {
+  color: #4ade80;
+  background: rgba(74, 222, 128, 0.16);
+  border-color: rgba(74, 222, 128, 0.6);
+}
+
+/* 配对面板更宽一些，但仍不超视口 */
+#lobby-panel.lobby-wide {
+  width: min(440px, 92vw);
+  max-height: calc(100vh - 28px);
+  overflow-y: auto;
+}
+
+#manual-pane { text-align: left; }
+
+.manual-label {
+  margin: 10px 0 4px;
+  font-size: 11px;
+  color: #9ca3af;
+  line-height: 1.4;
+}
+
+/* 配对码很长（几 KB）：等宽小字 + 横向滚动，不撑破面板 */
+#manual-out,
+#manual-in-invite,
+#manual-in-answer {
+  display: block;
+  width: 100%;
+  height: 64px;
+  padding: 6px 8px;
+  font-family: ui-monospace, "Courier New", Consolas, monospace;
+  font-size: 11px;
+  line-height: 1.35;
+  color: #a7f3d0;
+  background: #0b1020;
+  border: 1px solid rgba(255, 255, 255, 0.22);
+  border-radius: 6px;
+  outline: none;
+  resize: none;
+  white-space: pre;
+  overflow-x: auto;
+  overflow-y: auto;
+  word-break: normal;
+  overflow-wrap: normal;
+  -webkit-user-select: text;
+  user-select: text;
+}
+#manual-out:focus,
+#manual-in-invite:focus,
+#manual-in-answer:focus { border-color: #4ade80; }
+#manual-out { height: 76px; color: #fde047; }
+
+.manual-btn {
+  display: block;
+  width: 100%;
+  margin-top: 6px;
+  padding: 8px 0;
+  font: inherit;
+  font-size: 13px;
+  font-weight: bold;
+  color: #93c5fd;
+  background: rgba(96, 165, 250, 0.18);
+  border: 1px solid rgba(96, 165, 250, 0.55);
+  border-radius: 7px;
+  cursor: pointer;
+  touch-action: manipulation;
+}
+.manual-btn:active { background: rgba(96, 165, 250, 0.4); }
+.manual-btn:disabled { opacity: 0.45; cursor: default; }
+
+#btn-make-invite { color: #4ade80; background: rgba(74, 222, 128, 0.18); border-color: rgba(74, 222, 128, 0.55); }
+#btn-make-invite:active { background: rgba(74, 222, 128, 0.4); }
+#btn-accept-answer { color: #fbbf24; background: rgba(251, 191, 36, 0.16); border-color: rgba(251, 191, 36, 0.55); }
+#btn-accept-answer:active { background: rgba(251, 191, 36, 0.38); }
+#btn-copy { color: #e5e7eb; background: rgba(255, 255, 255, 0.1); border-color: rgba(255, 255, 255, 0.3); }
+
+#manual-status {
+  margin-top: 10px;
+  min-height: 20px;
+  font-size: 12px;
+  line-height: 1.5;
+  color: #fbbf24;
+  word-break: break-all;
+}
