@@ -24,6 +24,7 @@
   var pc = null; // 原生 RTCPeerConnection（仅 manual）
   var timer = null;
   var manualTimer = null;
+  var pendingReject = null; // manual：失败时用于 reject 当前的 Promise
   var afterOpen = null; // manual：DataChannel open 后用于 resolve Promise
   var suppress = false; // 主动清理期间静默对端回调
   var hbTimer = null;
@@ -116,6 +117,7 @@
     clearManualTimer();
     stopHeartbeat();
     afterOpen = null;
+    pendingReject = null;
     suppress = true;
     if (conn) { try { conn.close(); } catch (_) {} conn = null; }
     if (peer) { try { peer.destroy(); } catch (_) {} peer = null; }
@@ -155,15 +157,17 @@
   }
 
   // 离线配对失败：按规格回到 idle，同时触发 error，允许重试
-  function manualFail(code, reject) {
+  function manualFail(code) {
     clearManualTimer();
     afterOpen = null;
+    var rej = pendingReject;
+    pendingReject = null;
     cleanup();
     setState('idle');
     var payload = { code: code, message: errMsg(code) };
     emit('error', payload);
-    if (typeof reject === 'function') {
-      try { reject(new Error(payload.message)); } catch (_) {}
+    if (typeof rej === 'function') {
+      try { rej(new Error(payload.message)); } catch (_) {}
     }
   }
 
@@ -212,18 +216,25 @@
     };
 
     try {
-      ch.onopen = function () { adapter.open = true; adapter.fire('open'); };
+      var opened = false;
+      function fireOpen() {
+        if (opened) return;
+        opened = true;
+        adapter.open = true;
+        adapter.fire('open');
+      }
+      ch.onopen = function () { fireOpen(); };
       ch.onclose = function () { adapter.open = false; adapter.fire('close'); };
-      ch.onerror = function (e) { adapter.fire('error', e); };
+      ch.onerror = function (e) {
+        // 通道关闭瞬间也会报错，此时已由 close/心跳负责断线，不再重复报错
+        if (ch.readyState === 'open') adapter.fire('error', e);
+      };
       ch.onmessage = function (e) {
         var d = e && e.data;
         if (typeof d === 'string') { try { d = JSON.parse(d); } catch (_) {} }
         adapter.fire('data', d);
       };
-      if (ch.readyState === 'open') {
-        adapter.open = true;
-        setTimeout(function () { adapter.fire('open'); }, 0);
-      }
+      if (ch.readyState === 'open') setTimeout(fireOpen, 0);
     } catch (_) {}
 
     return adapter;
@@ -296,16 +307,18 @@
     });
   }
 
-  function wirePC(onFail) {
+  // ICE 失败或异常：已连上则按断线处理，未连上则按配对失败处理
+  function pcFail() {
+    if (state === 'connected') onLeave();
+    else manualFail('rtc-failed');
+  }
+
+  function wirePC() {
     if (!pc) return;
     try {
       pc.onconnectionstatechange = function () {
         try {
-          var s = pc && pc.connectionState;
-          if (s === 'failed') {
-            if (state === 'connected') onLeave();
-            else onFail('rtc-failed');
-          }
+          if (pc && pc.connectionState === 'failed') pcFail();
         } catch (_) {}
       };
     } catch (_) {}
@@ -379,20 +392,16 @@
       close();
       mode = 'manual';
       Net.isHost = true;
-      if (typeof RTCPeerConnection === 'undefined') { manualFail('no-webrtc', reject); return; }
+      if (typeof RTCPeerConnection === 'undefined') { manualFail('no-webrtc'); return; }
+      pendingReject = reject;
       setState('connecting');
       var done = false;
-      function onFail(code) {
-        if (done) return;
-        done = true;
-        manualFail(code, reject);
-      }
       try {
         var p = newPC();
-        wirePC(onFail);
+        wirePC();
         var ch = p.createDataChannel('game', { ordered: true });
         wireConn(wrapChannel(ch));
-      } catch (e) { onFail('rtc-failed'); return; }
+      } catch (e) { manualFail('rtc-failed'); return; }
 
       p.createOffer()
         .then(function (offer) { return p.setLocalDescription(offer); })
@@ -400,9 +409,14 @@
         .then(function () {
           if (done || pc !== p || !p.localDescription || !p.localDescription.sdp) return;
           done = true;
+          pendingReject = null;
           resolve(encodePayload('offer', p.localDescription.sdp));
         })
-        .catch(function () { onFail('rtc-failed'); });
+        .catch(function () {
+          if (done) return;
+          done = true;
+          manualFail('rtc-failed');
+        });
     });
   }
 
@@ -412,23 +426,19 @@
       close();
       mode = 'manual';
       Net.isHost = false;
-      if (typeof RTCPeerConnection === 'undefined') { manualFail('no-webrtc', reject); return; }
+      if (typeof RTCPeerConnection === 'undefined') { manualFail('no-webrtc'); return; }
 
       var payload;
-      try { payload = decodePayload(inviteCode); } catch (e) { manualFail('bad-code', reject); return; }
-      if (payload.t !== 'offer') { manualFail('bad-code', reject); return; }
+      try { payload = decodePayload(inviteCode); } catch (e) { manualFail('bad-code'); return; }
+      if (payload.t !== 'offer') { manualFail('bad-code'); return; }
 
+      pendingReject = reject;
       setState('connecting');
       var done = false;
-      function onFail(code) {
-        if (done) return;
-        done = true;
-        manualFail(code, reject);
-      }
 
       try {
         var p = newPC();
-        wirePC(onFail);
+        wirePC();
         p.ondatachannel = function (ev) {
           try { if (ev && ev.channel) wireConn(wrapChannel(ev.channel)); } catch (_) {}
         };
@@ -439,33 +449,42 @@
           .then(function () {
             if (done || pc !== p || !p.localDescription || !p.localDescription.sdp) return;
             done = true;
+            pendingReject = null;
             resolve(encodePayload('answer', p.localDescription.sdp));
           })
-          .catch(function () { onFail('rtc-failed'); });
-      } catch (e) { onFail('rtc-failed'); }
+          .catch(function () {
+            if (done) return;
+            done = true;
+            manualFail('rtc-failed');
+          });
+      } catch (e) { manualFail('rtc-failed'); }
     });
   }
 
   // 主机：粘贴应答码，完成连接
   function acceptAnswer(answerCode) {
     return new Promise(function (resolve, reject) {
-      if (mode !== 'manual' || !pc) { manualFail('no-invite', reject); return; }
+      if (mode !== 'manual' || !pc) { manualFail('no-invite'); return; }
       var payload;
-      try { payload = decodePayload(answerCode); } catch (e) { manualFail('bad-code', reject); return; }
-      if (payload.t !== 'answer') { manualFail('bad-code', reject); return; }
+      try { payload = decodePayload(answerCode); } catch (e) { manualFail('bad-code'); return; }
+      if (payload.t !== 'answer') { manualFail('bad-code'); return; }
 
       var p = pc;
+      pendingReject = reject;
       afterOpen = function () { resolve(); };
       clearManualTimer();
       manualTimer = setTimeout(function () {
         manualTimer = null;
-        manualFail('manual-timeout', reject);
+        manualFail('manual-timeout');
       }, MANUAL_CONNECT_TIMEOUT_MS);
 
       try {
         p.setRemoteDescription({ type: 'answer', sdp: payload.sdp })
-          .catch(function () { manualFail('rtc-failed', reject); });
-      } catch (e) { manualFail('rtc-failed', reject); }
+          .catch(function () {
+            if (state === 'connected') return;
+            manualFail('rtc-failed');
+          });
+      } catch (e) { manualFail('rtc-failed'); }
     });
   }
 
