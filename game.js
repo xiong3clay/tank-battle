@@ -1651,7 +1651,12 @@ class Game {
         for (let c = c1; c <= c2 && !hitWall; c++) {
           if (r < 0 || r >= ROWS || c < 0 || c >= COLS) { hitWall = true; break; }
           const tile = this.map[r][c];
-          if (tile === TILE_BRICK) { this.map[r][c] = TILE_EMPTY; hitWall = true; }
+          if (tile === TILE_BRICK) {
+            this.map[r][c] = TILE_EMPTY;
+            hitWall = true;
+            // 主机权威：把被打穿的砖墙坐标发给客机，否则客机仍显示这堵墙
+            if (this.mode === 'duel-host') this.netSend({ t: 'ev', kind: 'brick', r: r, c: c });
+          }
           else if (tile === TILE_STEEL || tile === TILE_BASE || tile === TILE_BASE_RUIN) hitWall = true;
         }
       }
@@ -1756,6 +1761,19 @@ class Game {
     } else if (ev.kind === 'explosion' || ev.kind === 'hit') {
       if (typeof ev.x === 'number' && typeof ev.y === 'number') this.addExplosion(ev.x, ev.y);
       this.sfx.play(ev.kind === 'hit' ? 'hit' : 'explosion');
+    } else if (ev.kind === 'brick') {
+      // 客机同步主机打穿的砖墙，保持两边地图一致
+      if (Array.isArray(ev.cells)) {
+        for (const cell of ev.cells) {
+          if (Array.isArray(cell) && this.map && this.map[cell[0]] && this.map[cell[0]][cell[1]] === TILE_BRICK) {
+            this.map[cell[0]][cell[1]] = TILE_EMPTY;
+          }
+        }
+      } else if (typeof ev.r === 'number' && typeof ev.c === 'number') {
+        if (this.map && this.map[ev.r] && this.map[ev.r][ev.c] === TILE_BRICK) {
+          this.map[ev.r][ev.c] = TILE_EMPTY;
+        }
+      }
     }
   }
 
