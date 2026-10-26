@@ -18,10 +18,11 @@
   var ICE_SERVERS = [{ urls: 'stun:stun.l.google.com:19302' }];
 
   var state = 'idle'; // idle | connecting | connected | error
-  var mode = 'peerjs'; // peerjs | manual
+  var mode = 'peerjs'; // peerjs | manual | relay
   var peer = null;
-  var conn = null; // 统一适配的连接对象（PeerJS DataConnection / 原生 DataChannel 包装）
+  var conn = null; // 统一适配的连接对象（PeerJS DataConnection / 原生 DataChannel 包装 / WebSocket 中继）
   var pc = null; // 原生 RTCPeerConnection（仅 manual）
+  var relayWs = null; // 自建服务器中继（仅 relay）
   var timer = null;
   var manualTimer = null;
   var pendingReject = null; // manual：失败时用于 reject 当前的 Promise
@@ -32,6 +33,7 @@
 
   var HB_INTERVAL = 2500; // 心跳间隔
   var HB_TIMEOUT = 8000; // 超过这个时间没收到任何数据 → 判定对端掉线
+  var RELAY_TIMEOUT_MS = 120000; // 自建服务器：等待对方加入的最长时间
 
   var handlers = { open: [], peer: [], leave: [], data: [], error: [] };
 
@@ -75,7 +77,13 @@
     'bad-code': '配对码格式不正确，请确认已完整复制',
     'rtc-failed': '直连建立失败，请重新生成配对码再试',
     'no-invite': '请先生成邀请码，再粘贴对方的应答码',
-    'manual-timeout': '等待对方连接超时，请重试'
+    'manual-timeout': '等待对方连接超时，请重试',
+    'bad-url': '服务器地址不正确，示例：http://192.168.1.5:8000',
+    'relay-failed': '连不上中继服务器，请检查地址与服务器是否已启动',
+    'relay-closed': '中继连接已断开，请重试',
+    'relay-error': '中继服务器返回错误',
+    'room-full': '房间已满，换一个房间号',
+    'relay-timeout': '等待对方加入超时，请确认对方用的是同一房间号'
   };
 
   function errMsg(code) {
@@ -120,6 +128,10 @@
     pendingReject = null;
     suppress = true;
     if (conn) { try { conn.close(); } catch (_) {} conn = null; }
+    if (relayWs) {
+      try { relayWs.onclose = null; relayWs.onerror = null; relayWs.close(); } catch (_) {}
+      relayWs = null;
+    }
     if (peer) { try { peer.destroy(); } catch (_) {} peer = null; }
     if (pc) {
       try {
@@ -265,8 +277,8 @@
     c.on('error', function (err) {
       if (suppress) return;
       var code = (err && err.type) || (err && err.name) || 'unknown';
-      if (mode === 'manual') {
-        // 手工模式出错同样回 idle，避免界面卡在 error 无法重试
+      if (mode === 'manual' || mode === 'relay') {
+        // 手工/中继模式出错同样回 idle，避免界面卡在 error 无法重试
         cleanup();
         setState('idle');
         emit('error', { code: code, message: errMsg(code) });
@@ -488,6 +500,133 @@
     });
   }
 
+  // ---------------- 自建服务器中继（WebSocket） ----------------
+  // 页面由自己服务器提供时可直接用当前 origin；否则传 http(s)://host:port 或 ws(s)://host:port
+  function relayWsUrl(base) {
+    var u = String(base || '').trim();
+    if (!u) {
+      var proto = (typeof location !== 'undefined' && location.protocol) || '';
+      u = (/^https?:$/.test(proto.replace(':', ''))) ? location.origin : 'http://127.0.0.1:8000';
+    }
+    if (/^https:\/\//i.test(u)) u = u.replace(/^https:\/\//i, 'wss://');
+    else if (/^http:\/\//i.test(u)) u = u.replace(/^http:\/\//i, 'ws://');
+    else if (!/^wss?:\/\//i.test(u)) {
+      var secure = (typeof location !== 'undefined' && location.protocol === 'https:');
+      u = (secure ? 'wss://' : 'ws://') + u;
+    }
+    u = u.replace(/\/+$/, '');
+    if (!/\/ws$/i.test(u)) u += '/ws';
+    return u;
+  }
+
+  function relayFail(code, message) {
+    var rej = pendingReject;
+    pendingReject = null;
+    clearTimer();
+    cleanup();
+    setState('idle');
+    var payload = { code: code, message: message || errMsg(code) };
+    emit('error', payload);
+    if (typeof rej === 'function') {
+      try { rej(new Error(payload.message)); } catch (_) {}
+    }
+  }
+
+  function relay(baseUrl, code, isHost) {
+    return new Promise(function (resolve, reject) {
+      code = String(code == null ? '' : code).trim();
+      if (!/^\d{4,8}$/.test(code)) { reject(new Error(errMsg('invalid-code'))); return; }
+      if (typeof WebSocket === 'undefined') { reject(new Error(errMsg('relay-failed'))); return; }
+
+      close();
+      mode = 'relay';
+      Net.isHost = !!isHost;
+      pendingReject = reject;
+      setState('connecting');
+
+      var listeners = { open: [], data: [], close: [], error: [] };
+      var adapter = {
+        peer: 'relay',
+        open: false,
+        send: function (obj) {
+          if (!relayWs || relayWs.readyState !== 1) return false;
+          try {
+            relayWs.send(typeof obj === 'string' ? obj : JSON.stringify(obj));
+            return true;
+          } catch (e) { return false; }
+        },
+        close: function () { try { if (relayWs) relayWs.close(); } catch (_) {} },
+        on: function (evt, fn) {
+          if (listeners[evt] && typeof fn === 'function') listeners[evt].push(fn);
+          return adapter;
+        },
+        fire: function (evt, arg) {
+          var list = listeners[evt] || [];
+          for (var i = 0; i < list.length; i++) { try { list[i](arg); } catch (_) {} }
+        }
+      };
+
+      var ws;
+      try { ws = new WebSocket(relayWsUrl(baseUrl)); } catch (e) { relayFail('bad-url'); return; }
+      relayWs = ws;
+      var paired = false;
+
+      clearTimer();
+      timer = setTimeout(function () {
+        timer = null;
+        if (!paired) relayFail('relay-timeout');
+      }, RELAY_TIMEOUT_MS);
+
+      ws.onopen = function () {
+        try {
+          ws.send(JSON.stringify({ t: 'join', room: code, role: isHost ? 'host' : 'guest' }));
+        } catch (_) { relayFail('relay-failed'); }
+      };
+
+      ws.onmessage = function (ev) {
+        var m;
+        try { m = JSON.parse(ev.data); } catch (_) { return; }
+        if (!m || typeof m !== 'object') return;
+
+        if (m.t === 'ready') {
+          if (paired) return;
+          paired = true;
+          clearTimer();
+          pendingReject = null;
+          adapter.open = true;
+          wireConn(adapter);
+          adapter.fire('open');
+          resolve();
+          return;
+        }
+        if (m.t === 'peer-left') {
+          if (paired) onLeave();
+          else relayFail('relay-closed');
+          return;
+        }
+        if (m.t === 'error') {
+          relayFail('room-full', m.message || errMsg('relay-error'));
+          return;
+        }
+        if (m.t === 'peer-joined') { lastSeen = Date.now(); emit('peer', code); return; }
+        if (m.t === 'hb') { lastSeen = Date.now(); return; }
+        lastSeen = Date.now();
+        emit('data', m);
+      };
+
+      ws.onclose = function () {
+        if (suppress) return;
+        if (state === 'connected') onLeave();
+        else if (!paired) relayFail('relay-closed');
+      };
+
+      ws.onerror = function () {
+        if (suppress) return;
+        if (state === 'connecting' && !paired) relayFail('relay-failed');
+      };
+    });
+  }
+
   // ---------------- 公共 API ----------------
   function close() {
     var wasConnected = (state === 'connected');
@@ -519,6 +658,7 @@
     createInvite: createInvite,
     useInvite: useInvite,
     acceptAnswer: acceptAnswer,
+    relay: relay,
     close: close,
     send: send,
     on: on,

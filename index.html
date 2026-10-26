@@ -21,6 +21,7 @@
     <div id="lobby-modes">
       <button id="mode-online" type="button" class="mode-tab mode-active">联网开房</button>
       <button id="mode-manual" type="button" class="mode-tab">离线配对</button>
+      <button id="mode-relay" type="button" class="mode-tab">自建服务器</button>
     </div>
 
     <div id="online-pane">
@@ -31,6 +32,18 @@
         <button id="btn-join" type="button">加入房间</button>
       </div>
       <div id="net-status"></div>
+    </div>
+
+    <div id="relay-pane" class="lobby-hidden">
+      <div class="manual-label">服务器地址（启动 server\\relay.js 后它会打印）</div>
+      <input id="relay-url" type="text" placeholder="http://192.168.1.5:8000" autocomplete="off">
+      <input id="relay-room" type="text" inputmode="numeric" maxlength="8" pattern="\d{4,8}"
+             placeholder="4~8 位房间号" autocomplete="off">
+      <div id="relay-btns">
+        <button id="btn-relay-host" type="button">开房间</button>
+        <button id="btn-relay-join" type="button">加入房间</button>
+      </div>
+      <div id="relay-status"></div>
     </div>
 
     <div id="manual-pane" class="lobby-hidden">
@@ -84,6 +97,10 @@
       panel = $('lobby-panel'), toggleBtn = $('lobby-toggle'), closeBtn = $('lobby-close'),
       modeOnline = $('mode-online'), modeManual = $('mode-manual'),
       onlinePane = $('online-pane'), manualPane = $('manual-pane'),
+      modeRelay = $('mode-relay'), relayPane = $('relay-pane'),
+      relayUrlInput = $('relay-url'), relayRoomInput = $('relay-room'),
+      btnRelayHost = $('btn-relay-host'), btnRelayJoin = $('btn-relay-join'),
+      relayStatusEl = $('relay-status'),
       btnMakeInvite = $('btn-make-invite'), btnUseInvite = $('btn-use-invite'),
       btnAcceptAnswer = $('btn-accept-answer'), btnCopy = $('btn-copy'),
       inInvite = $('manual-in-invite'), inAnswer = $('manual-in-answer'),
@@ -118,20 +135,69 @@
     if (btnAcceptAnswer) btnAcceptAnswer.disabled = busy;
   }
 
-  // ---------------- 模式切换：联网开房 / 离线配对 ----------------
+  // ---------------- 模式切换：联网开房 / 离线配对 / 自建服务器 ----------------
   var currentMode = 'online';
   function setMode(m) {
-    currentMode = (m === 'manual') ? 'manual' : 'online';
+    currentMode = (m === 'manual' || m === 'relay') ? m : 'online';
+    var isOnline = currentMode === 'online';
     var isManual = currentMode === 'manual';
-    if (onlinePane) onlinePane.classList.toggle('lobby-hidden', isManual);
+    var isRelay = currentMode === 'relay';
+    if (onlinePane) onlinePane.classList.toggle('lobby-hidden', !isOnline);
     if (manualPane) manualPane.classList.toggle('lobby-hidden', !isManual);
-    if (modeOnline) modeOnline.classList.toggle('mode-active', !isManual);
+    if (relayPane) relayPane.classList.toggle('lobby-hidden', !isRelay);
+    if (modeOnline) modeOnline.classList.toggle('mode-active', isOnline);
     if (modeManual) modeManual.classList.toggle('mode-active', isManual);
-    if (panel) panel.classList.toggle('lobby-wide', isManual);
+    if (modeRelay) modeRelay.classList.toggle('mode-active', isRelay);
+    if (panel) panel.classList.toggle('lobby-wide', !isOnline);
   }
   if (modeOnline) modeOnline.addEventListener('click', function () { setMode('online'); });
   if (modeManual) modeManual.addEventListener('click', function () { setMode('manual'); });
+  if (modeRelay) modeRelay.addEventListener('click', function () { setMode('relay'); });
   setMode('online');
+
+  function setRelayStatus(msg) { if (relayStatusEl) relayStatusEl.textContent = msg || ''; }
+  function setRelayBusy(b) {
+    if (btnRelayHost) btnRelayHost.disabled = b;
+    if (btnRelayJoin) btnRelayJoin.disabled = b;
+    if (relayUrlInput) relayUrlInput.disabled = b;
+    if (relayRoomInput) relayRoomInput.disabled = b;
+  }
+  function startRelay(isHost) {
+    if (!window.Net || typeof window.Net.relay !== 'function') { setRelayStatus('当前版本不支持自建服务器模式'); return; }
+    var url = (relayUrlInput && relayUrlInput.value ? relayUrlInput.value : '').trim() || location.origin;
+    var room = (relayRoomInput && relayRoomInput.value ? relayRoomInput.value : '').trim();
+    if (!/^\d{4,8}$/.test(room)) { setRelayStatus('请输入 4~8 位数字房间号'); return; }
+    duelStarted = false;
+    setRelayBusy(true);
+    setRelayStatus(isHost ? '正在创建房间…' : '正在加入房间…');
+    window.Net.relay(url, room, isHost).then(function () {
+      setRelayBusy(false);
+      setRelayStatus('连接成功，正在进入对战…');
+    }).catch(function (e) {
+      setRelayBusy(false);
+      setRelayStatus((e && e.message) || '连接失败，请重试');
+    });
+  }
+  if (btnRelayHost) btnRelayHost.addEventListener('click', function () { startRelay(true); });
+  if (btnRelayJoin) btnRelayJoin.addEventListener('click', function () { startRelay(false); });
+  if (relayRoomInput) relayRoomInput.addEventListener('input', function () {
+    relayRoomInput.value = relayRoomInput.value.replace(/\D/g, '').slice(0, 8);
+  });
+  // 本页若由自建服务器提供，自动预填地址
+  (function detectRelay() {
+    try {
+      if (!relayUrlInput || !/^https?:/.test(location.protocol)) return;
+      fetch('/health', { cache: 'no-store' })
+        .then(function (r) { return r.ok ? r.json() : null; })
+        .then(function (j) {
+          if (j && j.relay) {
+            relayUrlInput.value = location.origin;
+            setRelayStatus('已检测到本页由自建服务器提供，可直接开房');
+          }
+        })
+        .catch(function () {});
+    } catch (e) {}
+  })();
 
   // 输入框只允许 6 位数字
   input.addEventListener('input', function () {
@@ -280,6 +346,7 @@
     });
     Net.on('open', function () {
       if (currentMode === 'manual') setManualStatus('连接成功，正在进入对战…');
+      else if (currentMode === 'relay') setRelayStatus('连接成功，正在进入对战…');
       else setStatus('连接成功！正在进入对战…');
       hideForDuel = true;
       setExpanded(false);
@@ -290,16 +357,20 @@
       var msg = (err && err.message) || '连接失败，请重试';
       setBusy(false);
       setManualBusy(false);
+      setRelayBusy(false);
       if (currentMode === 'manual') setManualStatus(msg);
+      else if (currentMode === 'relay') setRelayStatus(msg);
       else setStatus(msg);
     });
     Net.on('leave', function () {
       setBusy(false);
       setManualBusy(false);
+      setRelayBusy(false);
       duelStarted = false;
       hideForDuel = false;
       var msg = '连接已断开，可重新开房或配对';
       if (currentMode === 'manual') setManualStatus(msg);
+      else if (currentMode === 'relay') setRelayStatus(msg);
       else setStatus(msg);
     });
   }
