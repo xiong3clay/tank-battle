@@ -52,7 +52,13 @@ const MIME = {
 function serveStatic(req, res) {
   if (req.url === '/health') {
     res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
-    res.end(JSON.stringify({ ok: true, relay: true, rooms: rooms.size, peers: peers.size, ts: Date.now() }));
+    const list = [];
+    for (const [code, r] of rooms) {
+      const seats = [];
+      for (let i = 0; i < r.seats.length; i++) if (r.seats[i]) seats.push(i);
+      list.push({ room: code, cap: r.cap, n: seats.length, seats, started: !!r.started });
+    }
+    res.end(JSON.stringify({ ok: true, relay: true, rooms: rooms.size, peers: peers.size, roomList: list, ts: Date.now() }));
     return;
   }
   let urlPath;
@@ -82,19 +88,41 @@ function serveStatic(req, res) {
 }
 
 // ---------------- 房间与连接 ----------------
-/** peer: { socket, role, room, alive } */
+/** peer: { socket, role, room, seat, alive } */
 const peers = new Set();
-/** room -> { host: peer|null, guest: peer|null } */
+/** room -> { cap, started, seats: [peer|null, ...] }（index 即座位号，host 占 0） */
 const rooms = new Map();
 
-function roomOf(code) {
-  if (!rooms.has(code)) rooms.set(code, { host: null, guest: null });
-  return rooms.get(code);
+function normalizeCap(v) {
+  const n = parseInt(v, 10);
+  if (!isFinite(n)) return 2;
+  return Math.max(2, Math.min(6, n));
 }
 
-function dropRoomIfEmpty(code) {
-  const r = rooms.get(code);
-  if (r && !r.host && !r.guest) rooms.delete(code);
+function occupiedSeats(r) {
+  const out = [];
+  for (let i = 0; i < r.seats.length; i++) if (r.seats[i]) out.push(i);
+  return out;
+}
+
+function eachPeer(r, fn) {
+  for (const p of r.seats) if (p && p.alive) fn(p);
+}
+
+// 广播房间状态（每次有人加入/离开都发）
+function broadcastRoom(r) {
+  const seats = occupiedSeats(r);
+  const msg = { t: 'room', cap: r.cap, n: seats.length, seats, started: !!r.started };
+  eachPeer(r, (p) => p.send(msg));
+}
+
+function roomOf(code, cap) {
+  let r = rooms.get(code);
+  if (!r) {
+    r = { cap: cap, started: false, seats: new Array(cap).fill(null) };
+    rooms.set(code, r);
+  }
+  return r;
 }
 
 // ---------------- WebSocket 帧编解码 ----------------
@@ -134,6 +162,7 @@ function makePeer(socket) {
     socket,
     role: null,
     room: null,
+    seat: null,
     alive: true,
     buf: Buffer.alloc(0),
     frag: [],           // 分片累积
@@ -160,15 +189,24 @@ function makePeer(socket) {
 
 function detach(peer) {
   if (!peer.room) return;
-  const r = rooms.get(peer.room);
-  if (!r) return;
-  if (r.host === peer) r.host = null;
-  if (r.guest === peer) r.guest = null;
-  const other = r.host || r.guest;
-  if (other) other.send({ t: 'peer-left' });
-  dropRoomIfEmpty(peer.room);
+  const code = peer.room;
+  const seat = peer.seat;
+  const r = rooms.get(code);
   peer.room = null;
+  peer.seat = null;
   peer.role = null;
+  if (!r || seat === null || seat === undefined) return;
+
+  if (r.seats[seat] === peer) r.seats[seat] = null;
+  const n = occupiedSeats(r).length;
+
+  if (n === 0) { rooms.delete(code); return; }
+
+  if (r.started) {
+    // 已开局：只通知座位离开，不重开（胜负由客户端处理）
+    eachPeer(r, (p) => p.send({ t: 'peer-left', seat }));
+  }
+  broadcastRoom(r);
 }
 
 function handleMessage(peer, text) {
@@ -177,37 +215,49 @@ function handleMessage(peer, text) {
   if (!msg || typeof msg !== 'object') return;
 
   if (msg.t === 'join') {
-    const room = String(msg.room || '');
-    if (!/^\d{4,8}$/.test(room)) { peer.send({ t: 'error', message: '房间号需为 4~8 位数字' }); return; }
+    const code = String(msg.room || '');
+    if (!/^\d{4,8}$/.test(code)) { peer.send({ t: 'error', message: '房间号需为 4~8 位数字' }); return; }
     if (peer.room) detach(peer);
 
-    const r = roomOf(room);
-    let role = msg.role === 'guest' ? 'guest' : 'host';
-    if (r[role]) { // 该位置已占用，尝试另一个位置
-      const alt = role === 'host' ? 'guest' : 'host';
-      if (r[alt]) { peer.send({ t: 'error', message: '房间已满' }); return; }
-      role = alt;
-    }
-    r[role] = peer;
-    peer.room = room;
-    peer.role = role;
-    peer.send({ t: 'ready', role });
+    const existing = rooms.get(code);
+    // 房间已存在时以现有 cap 为准；新建时用开房方给的 cap（2~6，默认 2）
+    const cap = existing ? existing.cap : normalizeCap(msg.cap);
+    const r = existing || roomOf(code, cap);
 
-    const other = role === 'host' ? r.guest : r.host;
-    if (other && other.alive) { other.send({ t: 'peer-joined' }); }
+    if (r.started) { peer.send({ t: 'error', message: '房间已开始' }); return; }
+
+    // 座位分配：host 优先 0，其余取最小空位
+    let seat = -1;
+    if (msg.role !== 'guest' && !r.seats[0]) seat = 0;
+    if (seat < 0) {
+      for (let i = 0; i < r.cap; i++) if (!r.seats[i]) { seat = i; break; }
+    }
+    if (seat < 0) { peer.send({ t: 'error', message: '房间已满' }); return; }
+
+    r.seats[seat] = peer;
+    peer.room = code;
+    peer.seat = seat;
+    peer.role = msg.role === 'guest' ? 'guest' : 'host';
+    peer.send({ t: 'ready', seat, cap: r.cap, role: peer.role });
+    broadcastRoom(r);
+
+    // 人满自动开局（只发一次）
+    if (!r.started && occupiedSeats(r).length >= r.cap) {
+      r.started = true;
+      eachPeer(r, (p) => p.send({ t: 'start' }));
+      broadcastRoom(r);
+    }
     return;
   }
 
   if (msg.t === 'leave') { detach(peer); return; }
 
-  // 其余全部转发给房间另一端
-  if (peer.room) {
-    const r = rooms.get(peer.room);
-    if (r) {
-      const other = (r.host === peer) ? r.guest : r.host;
-      if (other && other.alive) other.send(msg);
-    }
-  }
+  // 其余消息多播给同房间的其他所有连接，并注入发送者座位号
+  if (!peer.room || peer.seat === null) return;
+  const r = rooms.get(peer.room);
+  if (!r) return;
+  const out = Object.assign({}, msg, { from: peer.seat });
+  eachPeer(r, (p) => { if (p !== peer) p.send(out); });
 }
 
 function consume(peer, chunk) {

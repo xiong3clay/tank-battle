@@ -39,10 +39,21 @@
       <input id="relay-url" type="text" placeholder="http://192.168.1.5:8000" autocomplete="off">
       <input id="relay-room" type="text" inputmode="numeric" maxlength="8" pattern="\d{4,8}"
              placeholder="4~8 位房间号" autocomplete="off">
+      <div id="relay-cap-row">
+        <label for="relay-cap">房间人数</label>
+        <select id="relay-cap">
+          <option value="2" selected>2 人</option>
+          <option value="3">3 人</option>
+          <option value="4">4 人</option>
+          <option value="5">5 人</option>
+          <option value="6">6 人</option>
+        </select>
+      </div>
       <div id="relay-btns">
         <button id="btn-relay-host" type="button">开房间</button>
         <button id="btn-relay-join" type="button">加入房间</button>
       </div>
+      <div id="relay-room-info" class="lobby-hidden"></div>
       <div id="relay-status"></div>
     </div>
 
@@ -101,6 +112,8 @@
       relayUrlInput = $('relay-url'), relayRoomInput = $('relay-room'),
       btnRelayHost = $('btn-relay-host'), btnRelayJoin = $('btn-relay-join'),
       relayStatusEl = $('relay-status'),
+      relayCapSel = $('relay-cap'), relayCapRow = $('relay-cap-row'),
+      relayBtns = $('relay-btns'), relayRoomInfo = $('relay-room-info'),
       btnMakeInvite = $('btn-make-invite'), btnUseInvite = $('btn-use-invite'),
       btnAcceptAnswer = $('btn-accept-answer'), btnCopy = $('btn-copy'),
       inInvite = $('manual-in-invite'), inAnswer = $('manual-in-answer'),
@@ -161,20 +174,44 @@
     if (btnRelayJoin) btnRelayJoin.disabled = b;
     if (relayUrlInput) relayUrlInput.disabled = b;
     if (relayRoomInput) relayRoomInput.disabled = b;
+    if (relayCapSel) relayCapSel.disabled = b;
   }
+
+  // 等待开局：显示 "x/y 人已加入"，并隐藏开房/加入按钮与人数选择
+  var relayWaiting = false;
+  var relayStarted = false;
+  var relayRoom = null;
+  function renderRelayRoom() {
+    if (!relayRoomInfo) return;
+    var cap = (relayRoom && relayRoom.cap) || (window.Net && window.Net.cap) || 2;
+    var n = (relayRoom && relayRoom.n) || 0;
+    relayRoomInfo.textContent = n + '/' + cap + ' 人已加入，' +
+      (relayRoom && relayRoom.started ? '正在开局…' : '等待其他人…');
+  }
+  function setRelayWaiting(on) {
+    relayWaiting = !!on;
+    if (relayRoomInfo) relayRoomInfo.classList.toggle('lobby-hidden', !on);
+    if (relayBtns) relayBtns.classList.toggle('lobby-hidden', !!on);
+    if (relayCapRow) relayCapRow.classList.toggle('lobby-hidden', !!on);
+  }
+
   function startRelay(isHost) {
     if (!window.Net || typeof window.Net.relay !== 'function') { setRelayStatus('当前版本不支持自建服务器模式'); return; }
     var url = (relayUrlInput && relayUrlInput.value ? relayUrlInput.value : '').trim() || location.origin;
     var room = (relayRoomInput && relayRoomInput.value ? relayRoomInput.value : '').trim();
     if (!/^\d{4,8}$/.test(room)) { setRelayStatus('请输入 4~8 位数字房间号'); return; }
+    var cap = parseInt(relayCapSel && relayCapSel.value, 10);
+    if (!isFinite(cap)) cap = 2;
+    cap = Math.max(2, Math.min(6, cap));
     duelStarted = false;
+    relayStarted = false;
     setRelayBusy(true);
     setRelayStatus(isHost ? '正在创建房间…' : '正在加入房间…');
-    window.Net.relay(url, room, isHost).then(function () {
-      setRelayBusy(false);
-      setRelayStatus('连接成功，正在进入对战…');
+    window.Net.relay(url, room, isHost, cap).then(function () {
+      // 连接成功≠开局：等待服务端广播 room / start
     }).catch(function (e) {
       setRelayBusy(false);
+      setRelayWaiting(false);
       setRelayStatus((e && e.message) || '连接失败，请重试');
     });
   }
@@ -242,6 +279,19 @@
       duelStarted = true;
       try { g.startDuel(!!(window.Net && window.Net.isHost)); } catch (e) { console.error(e); }
     }
+  }
+
+  // 自建服务器多人房间：由服务端广播 'start' 触发。
+  // 新签名 startDuel(isHost, seat, cap)；旧签名只有 isHost，多传的参数会被自动忽略
+  function tryStartRelayDuel() {
+    if (duelStarted) return;
+    var g = window.__game;
+    if (!g || typeof g.startDuel !== 'function') return;
+    duelStarted = true;
+    var isHost = !!(window.Net && window.Net.isHost);
+    var seat = (window.Net && typeof window.Net.seat === 'number') ? window.Net.seat : (isHost ? 0 : 1);
+    var cap = (window.Net && window.Net.cap) || 2;
+    try { g.startDuel(isHost, seat, cap); } catch (e) { console.error(e); }
   }
 
   function readCode() {
@@ -345,19 +395,70 @@
       setStatus(Net.isHost ? '房间已创建，等待对方加入…' : '已连接服务器，正在加入…');
     });
     Net.on('open', function () {
+      if (currentMode === 'relay') {
+        // 自建服务器：连上只是进了房间，等人数够了由服务端广播 start 才开局
+        relayRoom = {
+          cap: (Net.cap || 2),
+          n: 1,
+          seats: (typeof Net.seat === 'number' ? [Net.seat] : []),
+          started: false
+        };
+        setRelayBusy(true);
+        setRelayWaiting(true);
+        renderRelayRoom();
+        setRelayStatus('已进入房间 ' + (relayRoomInput && relayRoomInput.value ? relayRoomInput.value.trim() : ''));
+        return;
+      }
       if (currentMode === 'manual') setManualStatus('连接成功，正在进入对战…');
-      else if (currentMode === 'relay') setRelayStatus('连接成功，正在进入对战…');
       else setStatus('连接成功！正在进入对战…');
       hideForDuel = true;
       setExpanded(false);
       lobby.classList.add('lobby-hidden');
       tryStartDuel();
     });
+    // 房间状态：{cap, n, seats, started}
+    Net.on('room', function (info) {
+      if (!info) return;
+      relayRoom = info;
+      if (info.cap) Net.cap = info.cap;
+      // 已开局后不再用房间状态覆盖「某人已离开」的提示（大厅此时已隐藏）
+      if (!relayStarted) {
+        if (info.started || (info.n >= info.cap)) {
+          setRelayStatus('房间已满，即将开局…');
+        } else {
+          setRelayStatus('房间号 ' + (relayRoomInput && relayRoomInput.value ? relayRoomInput.value.trim() : '') + '，等待其他人加入…');
+        }
+      }
+      renderRelayRoom();
+      if (relayRoomInfo) relayRoomInfo.classList.remove('lobby-hidden');
+    });
+    // 人满自动开局
+    Net.on('start', function () {
+      relayStarted = true;
+      renderRelayRoom();
+      setRelayStatus('人已到齐，正在开局…');
+      hideForDuel = true;
+      setExpanded(false);
+      lobby.classList.add('lobby-hidden');
+      tryStartRelayDuel();
+    });
+    // 开局后有人离开：提示座位号
+    Net.on('peer-left', function (p) {
+      var seat = (p && typeof p.seat === 'number') ? p.seat : '?';
+      setRelayStatus('座位 ' + seat + ' 的玩家已离开');
+      if (relayRoom) {
+        relayRoom.n = Math.max(0, (relayRoom.n || 1) - 1);
+        renderRelayRoom();
+      }
+    });
     Net.on('error', function (err) {
       var msg = (err && err.message) || '连接失败，请重试';
       setBusy(false);
       setManualBusy(false);
       setRelayBusy(false);
+      relayWaiting = false;
+      relayStarted = false;
+      setRelayWaiting(false);
       if (currentMode === 'manual') setManualStatus(msg);
       else if (currentMode === 'relay') setRelayStatus(msg);
       else setStatus(msg);
@@ -368,6 +469,9 @@
       setRelayBusy(false);
       duelStarted = false;
       hideForDuel = false;
+      relayWaiting = false;
+      relayStarted = false;
+      setRelayWaiting(false);
       var msg = '连接已断开，可重新开房或配对';
       if (currentMode === 'manual') setManualStatus(msg);
       else if (currentMode === 'relay') setRelayStatus(msg);
@@ -381,7 +485,11 @@
       var g = window.__game;
       var inStart = !!(g && g.state === 'start');
       lobby.classList.toggle('lobby-hidden', !inStart || hideForDuel);
-      if (inStart && !duelStarted && Net && Net.status() === 'connected') tryStartDuel();
+      if (!inStart || duelStarted) return;
+      if (relayStarted) { tryStartRelayDuel(); return; }
+      // 自建服务器：人没到齐（或还没收到 start）就先不开局
+      if (relayWaiting) return;
+      if (Net && Net.status() === 'connected') tryStartDuel();
     } catch (e) {}
   }, 200);
 })();

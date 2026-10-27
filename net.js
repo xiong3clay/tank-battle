@@ -35,7 +35,7 @@
   var HB_TIMEOUT = 8000; // 超过这个时间没收到任何数据 → 判定对端掉线
   var RELAY_TIMEOUT_MS = 120000; // 自建服务器：等待对方加入的最长时间
 
-  var handlers = { open: [], peer: [], leave: [], data: [], error: [] };
+  var handlers = { open: [], peer: [], leave: [], data: [], error: [], room: [], start: [], 'peer-left': [] };
 
   function setState(s) { state = s; }
 
@@ -142,6 +142,7 @@
       pc = null;
     }
     suppress = false;
+    if (Net) { Net.seat = null; Net.cap = 2; }
     setState('idle');
   }
 
@@ -153,6 +154,8 @@
 
   function startHeartbeat() {
     stopHeartbeat();
+    // 中继模式：连接存活由 WebSocket 自身断开检测，不用应用层心跳判死
+    if (mode === 'relay') return;
     lastSeen = Date.now();
     hbTimer = setInterval(function () {
       if (state !== 'connected' || !conn || !conn.open) return;
@@ -532,15 +535,20 @@
     }
   }
 
-  function relay(baseUrl, code, isHost) {
+  // baseUrl：http(s)://host:port 或 ws(s)://host:port；cap：房间人数 2~6（默认 2）
+  function relay(baseUrl, code, isHost, cap) {
     return new Promise(function (resolve, reject) {
       code = String(code == null ? '' : code).trim();
       if (!/^\d{4,8}$/.test(code)) { reject(new Error(errMsg('invalid-code'))); return; }
       if (typeof WebSocket === 'undefined') { reject(new Error(errMsg('relay-failed'))); return; }
+      cap = parseInt(cap, 10);
+      if (!isFinite(cap)) cap = 2;
+      cap = Math.max(2, Math.min(6, cap));
 
       close();
       mode = 'relay';
       Net.isHost = !!isHost;
+      Net.cap = cap;
       pendingReject = reject;
       setState('connecting');
 
@@ -579,7 +587,9 @@
 
       ws.onopen = function () {
         try {
-          ws.send(JSON.stringify({ t: 'join', room: code, role: isHost ? 'host' : 'guest' }));
+          var joinMsg = { t: 'join', room: code, role: isHost ? 'host' : 'guest' };
+          if (isHost) joinMsg.cap = cap; // 客机不用给 cap，以房间现有容量为准
+          ws.send(JSON.stringify(joinMsg));
         } catch (_) { relayFail('relay-failed'); }
       };
 
@@ -593,15 +603,33 @@
           paired = true;
           clearTimer();
           pendingReject = null;
+          Net.seat = (typeof m.seat === 'number') ? m.seat : (isHost ? 0 : 1);
+          if (m.cap) Net.cap = m.cap;
           adapter.open = true;
           wireConn(adapter);
           adapter.fire('open');
           resolve();
           return;
         }
+        if (m.t === 'room') {
+          lastSeen = Date.now();
+          if (typeof m.cap === 'number') Net.cap = m.cap;
+          emit('room', {
+            cap: m.cap,
+            n: m.n,
+            seats: m.seats || [],
+            started: !!m.started
+          });
+          return;
+        }
+        if (m.t === 'start') {
+          lastSeen = Date.now();
+          emit('start');
+          return;
+        }
         if (m.t === 'peer-left') {
-          if (paired) onLeave();
-          else relayFail('relay-closed');
+          lastSeen = Date.now();
+          emit('peer-left', { seat: (typeof m.seat === 'number' ? m.seat : null) });
           return;
         }
         if (m.t === 'error') {
@@ -663,7 +691,9 @@
     send: send,
     on: on,
     status: function () { return state; },
-    isHost: false
+    isHost: false,
+    seat: null, // 自建服务器分配的座位号（host=0）
+    cap: 2 // 房间人数（2~6）
   };
 
   window.Net = Net;
