@@ -1539,6 +1539,13 @@ class Game {
     for (let i = 0; i < cap; i++) {
       const t = this.tanks && this.tanks[i];
       if (!t) continue;
+      // 已淘汰（0 命）的玩家不再复活：留在数组里但不参与模拟、不渲染
+      if (this.duelLives && this.duelLives[i] === 0) {
+        t.alive = false;
+        t.invincible = 0;
+        t.fireCooldown = 0;
+        continue;
+      }
       const sp = DUEL_SPAWNS[i] || DUEL_SPAWNS[0];
       t.x = sp.x;
       t.y = sp.y;
@@ -1764,6 +1771,16 @@ class Game {
 
     this.duelLives[seat] = Math.max(0, this.duelLives[seat] - 1);
 
+    // 命耗尽 = 立即淘汰：该玩家退出战斗、不再复活，只等待其他人决出胜者
+    const eliminated = this.duelLives[seat] === 0;
+    if (eliminated) {
+      tank.alive = false;
+      tank.invincible = 0;
+      tank.fireCooldown = 0;
+      // 队手也能看到淘汰提示（换场景提示会被后续覆盖，所以单独发一条事件）
+      this.netSend({ t: 'ev', kind: 'eliminated', seat: seat });
+    }
+
     // 检查是否只剩一人有命
     const aliveSeats = [];
     for (let i = 0; i < this.duelCap; i++) {
@@ -1779,13 +1796,13 @@ class Game {
       return;
     }
 
-    // 换场景：scene+1 → 重新生成地图 → 所有人复位并短暂无敌
+    // 换场景：scene+1 → 重新生成地图 → 未淘汰的玩家复位并短暂无敌
     this.duelScene++;
     this.duelMapRev++;
     this.map = this.generateMap(this.duelScene);
     this.bullets = [];
     this.resetDuelTanks();
-    this.duelNotice = '换 场 景';
+    this.duelNotice = eliminated ? `玩家 ${seat + 1} 被淘汰` : '换 场 景';
     this.duelNoticeT = DUEL_NOTICE_TIME;
     this.sendSnapshot();
   }
@@ -1801,7 +1818,11 @@ class Game {
     if (this.inputAcc >= INPUT_INTERVAL) {
       this.inputAcc = 0;
       this.inputSeq++;
-      this.netSend({ t: 'in', k: this.readLocalKeys(), seq: this.inputSeq });
+      // 已被淘汰就发空输入，不再干扰战局
+      const k = (this.duelLives && this.duelLives[this.localSeat] > 0)
+        ? this.readLocalKeys()
+        : { u: 0, d: 0, l: 0, r: 0, f: 0 };
+      this.netSend({ t: 'in', k: k, seq: this.inputSeq });
     }
   }
 
@@ -1853,6 +1874,13 @@ class Game {
     } else if (ev.kind === 'explosion' || ev.kind === 'hit') {
       if (typeof ev.x === 'number' && typeof ev.y === 'number') this.addExplosion(ev.x, ev.y);
       this.sfx.play(ev.kind === 'hit' ? 'hit' : 'explosion');
+    } else if (ev.kind === 'eliminated') {
+      // 主机通报某人出局，所有端显示提示（自己被淘汰时有独立覆盖层）
+      const n = (typeof ev.seat === 'number' ? ev.seat : 0) + 1;
+      if (typeof ev.seat === 'number' && ev.seat !== this.localSeat) {
+        this.duelNotice = `玩家 ${n} 被淘汰`;
+        this.duelNoticeT = DUEL_NOTICE_TIME;
+      }
     } else if (ev.kind === 'brick') {
       // 客机同步主机打穿的砖墙，保持两边地图一致
       if (Array.isArray(ev.cells)) {
@@ -1941,10 +1969,33 @@ class Game {
     for (const b of this.bullets) this.renderBullet(b);
     for (const t of this.tanks) if (t && t.alive) this.renderTank(t);
     this.renderDuelHUD();
-    if (this.duelNoticeT > 0) this.renderDuelNotice();
+    const localOut = !!(this.duelLives && this.duelLives[this.localSeat] === 0);
+    // 自己被淘汰时优先显示淘汰覆盖层，避免和「换场景」提示叠字
+    if (this.duelNoticeT > 0 && !(this.state === 'playing' && localOut)) this.renderDuelNotice();
+    if (this.state === 'playing' && localOut) {
+      this.renderDuelEliminated();
+    }
     if (this.state === 'paused') this.renderPause();
     else if (this.state === 'over') this.renderDuelOver();
     this.syncTouchButtons();
+  }
+
+  // 自己被淘汰：显示失败并等待其他人决出胜者（战局仍在下方继续，可当观战）
+  renderDuelEliminated() {
+    const ctx = this.ctx;
+    ctx.save();
+    ctx.fillStyle = 'rgba(0,0,0,0.42)';
+    ctx.fillRect(0, HEIGHT / 2 - 74, WIDTH, 148);
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillStyle = '#ef4444';
+    ctx.font = 'bold 44px Consolas, monospace';
+    ctx.fillText('你已被淘汰', WIDTH / 2, HEIGHT / 2 - 30);
+    ctx.fillStyle = COLORS.hud;
+    ctx.font = '18px Consolas, monospace';
+    ctx.fillText('等待其他玩家决出胜者…', WIDTH / 2, HEIGHT / 2 + 24);
+    ctx.restore();
+    ctx.textAlign = 'left';
   }
 
   renderDuelHUD() {
@@ -1966,7 +2017,8 @@ class Game {
       const color = SEAT_COLORS[i] || SEAT_COLORS[0];
       const prefix = i === this.localSeat ? '我' : `P${i}`;
       const label = `${prefix} ${hearts(this.duelLives[i])}`;
-      ctx.fillStyle = this.duelDisconnected[i] ? '#666' : color.body;
+      const out = this.duelDisconnected[i] || this.duelLives[i] === 0;
+      ctx.fillStyle = out ? '#666' : color.body;
       ctx.fillText(label, xOff, 14);
       xOff += Math.max(70, ctx.measureText(label).width + 14);
     }
